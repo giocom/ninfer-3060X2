@@ -463,13 +463,41 @@ Bf16GdnGatingPlan bf16_gdn_gating_resolve_plan(const Bf16GdnGatingProblem& probl
     if (is_27(problem)) {
         for (const RouteSpec& route : k27Routes) {
             if (route.cols.contains(problem.cols)) {
-                return bf16_gdn_gating_resolve_candidate(route.schedule, problem);
+                if (candidate_is_legal(route.schedule, problem)) {
+                    return bf16_gdn_gating_resolve_candidate(route.schedule, problem);
+                }
+                if (candidate_is_legal(Bf16GdnGatingScheduleId::MmaCooperativeSplit4, problem)) {
+                    return bf16_gdn_gating_resolve_candidate(
+                        Bf16GdnGatingScheduleId::MmaCooperativeSplit4, problem);
+                }
+                if (candidate_is_legal(Bf16GdnGatingScheduleId::MmaCooperativeSplit2, problem)) {
+                    return bf16_gdn_gating_resolve_candidate(
+                        Bf16GdnGatingScheduleId::MmaCooperativeSplit2, problem);
+                }
+                return bf16_gdn_gating_resolve_candidate(Bf16GdnGatingScheduleId::MmaUnsplit,
+                                                         problem);
             }
         }
     } else {
         for (const RouteSpec& route : k35Routes) {
             if (route.cols.contains(problem.cols)) {
-                return bf16_gdn_gating_resolve_candidate(route.schedule, problem);
+                if (candidate_is_legal(route.schedule, problem)) {
+                    return bf16_gdn_gating_resolve_candidate(route.schedule, problem);
+                }
+                if (candidate_is_legal(Bf16GdnGatingScheduleId::MmaCooperativeSplit8, problem)) {
+                    return bf16_gdn_gating_resolve_candidate(
+                        Bf16GdnGatingScheduleId::MmaCooperativeSplit8, problem);
+                }
+                if (candidate_is_legal(Bf16GdnGatingScheduleId::MmaCooperativeSplit4, problem)) {
+                    return bf16_gdn_gating_resolve_candidate(
+                        Bf16GdnGatingScheduleId::MmaCooperativeSplit4, problem);
+                }
+                if (candidate_is_legal(Bf16GdnGatingScheduleId::MmaCooperativeSplit2, problem)) {
+                    return bf16_gdn_gating_resolve_candidate(
+                        Bf16GdnGatingScheduleId::MmaCooperativeSplit2, problem);
+                }
+                return bf16_gdn_gating_resolve_candidate(Bf16GdnGatingScheduleId::MmaUnsplit,
+                                                         problem);
             }
         }
     }

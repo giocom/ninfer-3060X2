@@ -276,6 +276,7 @@ int main(int argc, char** argv) {
         ninfer::product::LoadProgressRenderer load_progress(
             std::cerr, ninfer::product::stderr_load_progress_options());
         ninfer::EngineOptions engine_options;
+        engine_options.artifact_path  = cli.artifact_path.string();
         engine_options.device         = cli.device;
         engine_options.devices        = cli.devices;
         engine_options.tensor_split   = cli.tensor_split;
