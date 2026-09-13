@@ -125,6 +125,18 @@ void Binder::validate_only(ObjectHandle handle) {
     planned_[handle.index] = true;
 }
 
+void Binder::validate_unconsumed_matching(std::string_view prefix) {
+    for (std::size_t i = 0; i < reader_.objects().size(); ++i) {
+        if (!consumed_[i]) {
+            std::string_view name = object_name(reader_.objects()[i]);
+            if (prefix.empty() || name.starts_with(prefix)) {
+                consumed_[i] = true;
+                planned_[i]  = true;
+            }
+        }
+    }
+}
+
 MaterializationPlan Binder::finish() {
     const auto it = std::find(consumed_.begin(), consumed_.end(), false);
     if (it != consumed_.end()) {

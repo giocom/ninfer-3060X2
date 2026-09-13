@@ -485,6 +485,9 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
         binder, "vision/merger/fc2_bias", NumericFormat::BF16, {5120}, vision_placement);
     out.vision_merger_norm = qwen3_6::bind_vision_merger_norm(binder, vision_placement);
 
+    // Validate any companion DFlash/DFlash2 tensors present in artifact so they don't consume VRAM
+    binder.validate_unconsumed_matching("dflash");
+
     load_plan.materialization = binder.finish();
     return load_plan;
 }
