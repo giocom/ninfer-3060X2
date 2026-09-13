@@ -3,6 +3,7 @@
 #include <cuda_runtime.h>
 
 #include <cstddef>
+#include <vector>
 
 namespace ninfer {
 
@@ -33,6 +34,12 @@ struct DeviceContext {
     int sm_count() const noexcept;
     std::size_t total_vram() const noexcept;
     void synchronize() const;
+
+    static int device_count();
+    static void enable_peer_access(int src_dev, int dst_dev);
+    static void enable_all_peer_access(const std::vector<int>& devices);
+    static std::size_t total_vram_for_devices(const std::vector<int>& devices);
+    static std::size_t free_vram_for_devices(const std::vector<int>& devices);
 };
 
 class CudaEventTimer {

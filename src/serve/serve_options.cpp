@@ -63,6 +63,40 @@ KvCapacityPolicy parse_kv_capacity(const char* text) {
     return KvCapacityPolicy::explicit_capacity(static_cast<std::uint32_t>(value));
 }
 
+std::vector<int> parse_devices(const char* text) {
+    std::vector<int> devices;
+    std::string s(text);
+    std::size_t start = 0;
+    while (start < s.size()) {
+        auto comma = s.find(',', start);
+        if (comma == std::string::npos) { comma = s.size(); }
+        std::string token = s.substr(start, comma - start);
+        if (!token.empty()) {
+            devices.push_back(parse_nonnegative_int(token.c_str(), "device"));
+        }
+        start = comma + 1;
+    }
+    if (devices.empty()) { throw std::invalid_argument("devices list must not be empty"); }
+    return devices;
+}
+
+std::vector<float> parse_tensor_split(const char* text) {
+    std::vector<float> splits;
+    std::string s(text);
+    std::size_t start = 0;
+    while (start < s.size()) {
+        auto comma = s.find(',', start);
+        if (comma == std::string::npos) { comma = s.size(); }
+        std::string token = s.substr(start, comma - start);
+        if (!token.empty()) {
+            splits.push_back(parse_float_in(token.c_str(), "tensor-split", 0.0f, 1000.0f));
+        }
+        start = comma + 1;
+    }
+    if (splits.empty()) { throw std::invalid_argument("tensor-split list must not be empty"); }
+    return splits;
+}
+
 } // namespace
 
 std::string serve_usage_text(const char* argv0) {
@@ -70,8 +104,8 @@ std::string serve_usage_text(const char* argv0) {
            " <model.ninfer> [--host H] [--port N] [--api-key KEY] "
            "[--model-id ID] [--max-context N] [--kv-capacity N|auto] [--max-concurrency N] "
            "[--max-pending-requests N] [--pending-timeout-ms N] "
-           "[--prefill-chunk N] [--log-stats-interval-ms N] [--device N] "
-           "[--context-cost-presets FILE] "
+           "[--prefill-chunk N] [--log-stats-interval-ms N] [--device N] [--devices N,N...] "
+           "[--tensor-split N,N...] [--context-cost-presets FILE] "
            "[--max-request-mib N] [--media-cache-mib N] [--media-live-mib N] "
            "[--media-preprocess-threads N] "
            "[--device-state-slots N] [--host-state-slots N] [--host-kv-mib N] "
@@ -264,6 +298,14 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.response_store_max_bytes = static_cast<std::size_t>(mib << 20);
         } else if (arg == "--device") {
             options.device = parse_nonnegative_int(require_value("--device"), "device");
+            options.devices = {options.device};
+        } else if (arg == "--devices") {
+            options.devices = parse_devices(require_value("--devices"));
+            if (!options.devices.empty()) {
+                options.device = options.devices[0];
+            }
+        } else if (arg == "--tensor-split" || arg == "--ts") {
+            options.tensor_split = parse_tensor_split(require_value(arg.c_str()));
         } else if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_dtype(require_value("--kv-dtype"));
         } else if (arg == "--spec") {

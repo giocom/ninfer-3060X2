@@ -20,8 +20,9 @@ struct Options {
     std::uint32_t max_new        = 128;
     std::uint32_t max_context    = 2048;
     KvCapacityPolicy kv_capacity = KvCapacityPolicy::explicit_capacity(2048);
-    std::uint32_t prefill_chunk  = 1024;
     int device                   = 0;
+    std::vector<int> devices     = {0};
+    std::vector<float> tensor_split = {};
 
     KvCacheStorage kv_cache = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;

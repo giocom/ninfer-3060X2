@@ -41,6 +41,40 @@ int parse_device(const char* text) {
     return static_cast<int>(value);
 }
 
+std::vector<int> parse_devices(const char* text) {
+    std::vector<int> devices;
+    std::string s(text);
+    std::size_t start = 0;
+    while (start < s.size()) {
+        auto comma = s.find(',', start);
+        if (comma == std::string::npos) { comma = s.size(); }
+        std::string token = s.substr(start, comma - start);
+        if (!token.empty()) {
+            devices.push_back(parse_device(token.c_str()));
+        }
+        start = comma + 1;
+    }
+    if (devices.empty()) { throw std::invalid_argument("devices list must not be empty"); }
+    return devices;
+}
+
+std::vector<float> parse_tensor_split(const char* text) {
+    std::vector<float> splits;
+    std::string s(text);
+    std::size_t start = 0;
+    while (start < s.size()) {
+        auto comma = s.find(',', start);
+        if (comma == std::string::npos) { comma = s.size(); }
+        std::string token = s.substr(start, comma - start);
+        if (!token.empty()) {
+            splits.push_back(parse_float(token.c_str(), "tensor-split", 0.0f, 1000.0f));
+        }
+        start = comma + 1;
+    }
+    if (splits.empty()) { throw std::invalid_argument("tensor-split list must not be empty"); }
+    return splits;
+}
+
 float parse_float(const char* text, std::string_view label, float minimum, float maximum) {
     errno              = 0;
     char* end          = nullptr;
@@ -80,7 +114,7 @@ std::string usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
            " <model.ninfer> (--prompt <text>|--messages <messages.json>)\n"
            "       [--max-context N] [--kv-capacity N|auto] [--prefill-chunk N] [--max-new N]\n"
-           "       [--device N]\n"
+           "       [--device N] [--devices N,N...] [--tensor-split N,N...]\n"
            "       [--kv-dtype bf16|int8|fp8] [--spec mtp|dflash --draft-tokens N]\n"
            "       [--lm-head-draft]\n"
            "       [--temperature F] [--top-p F] [--top-k N] [--min-p F]\n"
@@ -135,6 +169,14 @@ Options parse_options(int argc, char** argv) {
             options.prefill_chunk = parse_u32(value(arg), "prefill-chunk");
         } else if (arg == "--device") {
             options.device = parse_device(value(arg));
+            options.devices = {options.device};
+        } else if (arg == "--devices") {
+            options.devices = parse_devices(value(arg));
+            if (!options.devices.empty()) {
+                options.device = options.devices[0];
+            }
+        } else if (arg == "--tensor-split" || arg == "--ts") {
+            options.tensor_split = parse_tensor_split(value(arg));
         } else if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_cache(value(arg));
         } else if (arg == "--spec") {

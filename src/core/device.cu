@@ -127,6 +127,65 @@ std::size_t DeviceContext::total_vram() const noexcept { return props.totalGloba
 
 void DeviceContext::synchronize() const { CUDA_CHECK(cudaStreamSynchronize(stream)); }
 
+int DeviceContext::device_count() {
+    int count = 0;
+    const cudaError_t err = cudaGetDeviceCount(&count);
+    return err == cudaSuccess ? count : 0;
+}
+
+void DeviceContext::enable_peer_access(int src_dev, int dst_dev) {
+    if (src_dev == dst_dev) { return; }
+    int can_access = 0;
+    cudaDeviceCanAccessPeer(&can_access, src_dev, dst_dev);
+    if (can_access) {
+        int current_device = 0;
+        cudaGetDevice(&current_device);
+        cudaSetDevice(src_dev);
+        const cudaError_t err = cudaDeviceEnablePeerAccess(dst_dev, 0);
+        if (err != cudaSuccess && err != cudaErrorPeerAccessAlreadyEnabled) {
+            cudaGetLastError(); // clear error
+        }
+        cudaSetDevice(current_device);
+    }
+}
+
+void DeviceContext::enable_all_peer_access(const std::vector<int>& devices) {
+    for (int src : devices) {
+        for (int dst : devices) {
+            if (src != dst) {
+                enable_peer_access(src, dst);
+            }
+        }
+    }
+}
+
+std::size_t DeviceContext::total_vram_for_devices(const std::vector<int>& devices) {
+    std::size_t total = 0;
+    for (int dev : devices) {
+        cudaDeviceProp p{};
+        if (cudaGetDeviceProperties(&p, dev) == cudaSuccess) {
+            total += p.totalGlobalMem;
+        }
+    }
+    return total;
+}
+
+std::size_t DeviceContext::free_vram_for_devices(const std::vector<int>& devices) {
+    std::size_t total_free = 0;
+    int current = 0;
+    cudaGetDevice(&current);
+    for (int dev : devices) {
+        cudaSetDevice(dev);
+        std::size_t free_b = 0;
+        std::size_t total_b = 0;
+        if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess) {
+            total_free += free_b;
+        }
+    }
+    cudaSetDevice(current);
+    return total_free;
+}
+
 CudaEventTimer::CudaEventTimer(const DeviceContext& ctx) : CudaEventTimer(ctx, ctx.stream) {}
 
 CudaEventTimer::CudaEventTimer(const DeviceContext& ctx, cudaStream_t stream) : stream_(stream) {

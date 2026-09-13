@@ -67,10 +67,15 @@ artifact::LoadProgress artifact_progress(const LoadProgress& progress) {
     return artifact::LoadProgress{.callback = progress.callback};
 }
 
-std::size_t runtime_bytes_after_planned_weights(std::uint64_t weight_bytes) {
+std::size_t runtime_bytes_after_planned_weights(std::uint64_t weight_bytes, const EngineOptions& options) {
     std::size_t free_bytes  = 0;
-    std::size_t total_bytes = 0;
-    CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
+    if (options.devices.size() > 1 || !options.tensor_split.empty()) {
+        DeviceContext::enable_all_peer_access(options.devices);
+        free_bytes = DeviceContext::free_vram_for_devices(options.devices);
+    } else {
+        std::size_t total_bytes = 0;
+        CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
+    }
     if (weight_bytes > free_bytes) {
         throw std::invalid_argument("model weights require " + std::to_string(weight_bytes) +
                                     " bytes of device memory, but only " +
@@ -80,7 +85,10 @@ std::size_t runtime_bytes_after_planned_weights(std::uint64_t weight_bytes) {
     return free_bytes - static_cast<std::size_t>(weight_bytes);
 }
 
-std::size_t current_free_device_bytes() {
+std::size_t current_free_device_bytes(const EngineOptions& options) {
+    if (options.devices.size() > 1 || !options.tensor_split.empty()) {
+        return DeviceContext::free_vram_for_devices(options.devices);
+    }
     std::size_t free_bytes  = 0;
     std::size_t total_bytes = 0;
     CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
@@ -91,6 +99,9 @@ template <class Target, class Loaded, class Instance>
 ConstructedTarget construct_registered(const EngineOptions& options, DeviceContext& device,
                                        artifact::Reader& reader, Clock::time_point load_start,
                                        std::string_view target_key) {
+    if (options.devices.size() > 1 || !options.tensor_split.empty()) {
+        DeviceContext::enable_all_peer_access(options.devices);
+    }
     const auto& identity                          = reader.identity();
     const auto weights_profile                    = Target::resolve_weights(identity);
     const ModelSamplingDefaults sampling_defaults = Target::sampling_defaults(identity.model_id);
@@ -108,7 +119,7 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
     auto sequence_planner = Target::make_sequence_planner(device, options, weights_profile);
     const runtime::SequenceCapacityCurve curve = sequence_planner.capacity_curve();
     const std::size_t preflight_runtime_bytes =
-        runtime_bytes_after_planned_weights(load_plan.materialization().device_capacity_bytes);
+        runtime_bytes_after_planned_weights(load_plan.materialization().device_capacity_bytes, options);
     (void)runtime::resolve_kv_capacity(options.kv_capacity, curve, preflight_runtime_bytes);
 
     auto progress     = artifact_progress(options.load_progress);
@@ -119,7 +130,7 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
     auto model = Target::construct_loaded_model(std::move(load_plan), std::move(materialized));
     device.synchronize();
     runtime::KvCapacityResolution capacity_resolution =
-        runtime::resolve_kv_capacity(options.kv_capacity, curve, current_free_device_bytes());
+        runtime::resolve_kv_capacity(options.kv_capacity, curve, current_free_device_bytes(options));
     auto sequence_plan = std::move(sequence_planner).finalize(capacity_resolution.main_page_groups);
     if (sequence_plan.device_reservation_bytes() != capacity_resolution.runtime_reservation_bytes ||
         sequence_plan.kv_capacity() != capacity_resolution.resolved_tokens) {
@@ -129,7 +140,7 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
     auto instance = std::make_unique<Instance>(std::move(loaded), capacity_resolution,
                                                std::move(sequence_plan), device);
     device.synchronize();
-    instance->kv_capacity_resolution.available_after_startup_bytes = current_free_device_bytes();
+    instance->kv_capacity_resolution.available_after_startup_bytes = current_free_device_bytes(options);
 
     LoadSummary summary;
     summary.target               = std::string(target_key);

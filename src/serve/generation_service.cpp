@@ -263,6 +263,8 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
     ninfer::EngineOptions engine_options;
     engine_options.artifact_path            = options_.artifact_path;
     engine_options.device                   = options_.device;
+    engine_options.devices                  = options_.devices;
+    engine_options.tensor_split             = options_.tensor_split;
     engine_options.max_context              = options_.max_context;
     engine_options.kv_capacity              = options_.kv_capacity;
     engine_options.max_concurrency          = options_.max_concurrency;

@@ -1,18 +1,11 @@
-# NInfer-3090
+# NInfer-3090 / Dual RTX 3060 (2x 12GB)
 
-NInfer-3090 is a specialized C++20/CUDA inference engine for **Qwen3.8-27B** and Qwen3.6 on one
-24 GB NVIDIA GeForce RTX 3090. Qwen3.8-27B is a first-class, tested target: the native SM86
-runtime loads its official groupwise `.ninfer` artifact, serves OpenAI- and Anthropic-compatible
-APIs, and supports paged KV, compatible-prefix reuse, CUDA Graphs, MTP speculative decoding,
-reasoning-effort control, ReplaySSM state transactions, and concurrent cohorts through **C8**.
+NInfer is a specialized C++20/CUDA inference engine for **Qwen3.8-27B** and Qwen3.6 on NVIDIA Ampere (SM86) GPUs, including **1x RTX 3090 (24 GB)** and **2x RTX 3060 (12 GB x 2 = 24 GB)**. Qwen3.8-27B is a first-class, tested target: the native SM86 runtime loads its official groupwise `.ninfer` artifact, serves OpenAI- and Anthropic-compatible APIs, and supports multi-GPU tensor split (`--tensor-split 0.5,0.5`), paged KV, compatible-prefix reuse, CUDA Graphs, MTP speculative decoding, reasoning-effort control, ReplaySSM state transactions, and context lengths exceeding **131K tokens**.
 
 Community project, maintained on a best-effort basis. Issues and PRs are very welcome, but support
 and feature requests are not guaranteed.
 
-
-
-On an RTX 3090, Qwen3.8-27B supports a measured **171K-token INT8 context** with the standard
-1 GiB safety headroom.
+On Dual RTX 3060 12GB (or an RTX 3090), Qwen3.8-27B supports a measured **131K~171K-token INT8 context** with the standard 1 GiB safety headroom.
 
 > **RotorQuant `rk8v4` is temporarily unavailable.** Upstream moved KV quantization out of the
 > fused GQA attention kernels into a dedicated `kv_cache_append` Op whose contract defines K
@@ -25,34 +18,32 @@ This fork targets `sm_86`. Blackwell-only NVFP4/W4A4 and FP8 A8 tensor-core exec
 unavailable. FP8 and NVFP4 *weights* are admitted through their A16 dequantizing routes, but the
 FP8 E4M3 *KV-cache* profile is not: its attention kernels have no SM86 implementation. 
 
-The goal is the make the utmost rippin Qwen inference stack for the 3000 series. Gladly taking PR's, all help much appreciated. 
+The goal is to make the utmost rippin Qwen inference stack for the 3000 series (including RTX 3090 and Dual RTX 3060 12GB). Gladly taking PR's, all help much appreciated. 
 
 Release notes for this branch: [v0.6.1](RELEASE_NOTES_0.6.1.md).
 
-## Choose a platform
+## Choose a platform & hardware
 
-| Platform | Delivery | Guide |
+| Platform / Setup | Delivery | Guide |
 |---|---|---|
-| Linux | Docker image or native source build | [Linux build guide](docs/rtx-3090-linux.md) |
-| Windows 11 | Prebuilt release archive | [Windows guide](docs/rtx-3090-windows.md) |
+| Dual RTX 3060 12GB (Windows) | Release archive / Batch scripts | [Dual RTX 3060 Windows Guide](docs/rtx-3060x2-windows.md) |
+| Dual RTX 3060 12GB (Linux) | Source build / Bash scripts | [Linux Full Guide](README_LINUX.md) / [Dual RTX 3060 Linux](docs/rtx-3060x2-linux.md) |
+| RTX 3090 24GB (Windows) | Prebuilt release archive | [Windows guide](docs/rtx-3090-windows.md) |
+| RTX 3090 24GB (Linux) | Docker image or native source build | [Linux Full Guide](README_LINUX.md) / [RTX 3090 Linux](docs/rtx-3090-linux.md) |
 
-### Linux
+### Dual RTX 3060 12GB Launchers (Windows 11)
 
-The Dockerfile gives the shortest build path on Bazzite and other Linux distributions:
+1. Double-click `download-qwen38.bat` to download the model artifact.
+2. Launch one of the Dual-GPU scripts:
 
-```bash
-docker build --tag ninfer-3090:sm86 .
-```
+| Launcher | Best for |
+|---|---|
+| `run-qwen38-3060x2-131k.bat` | **131K+ context** (131,072 tokens), Tensor Split 50:50, INT8 KV |
+| `run-qwen38-c1-3060x2.bat` | One interactive user, lowest latency, up to 64K context |
+| `run-qwen38-c8-3060x2.bat` | Multiple users/agents, aggregate throughput, 8K context |
+| `benchmark-qwen38-3060x2.bat` | Benchmark throughput on Dual RTX 3060 setup |
 
-The Linux guide contains the GPU check, native Ubuntu build, model mount, server command, and Bash
-launchers. The project does not publish a prebuilt Linux archive or qualified Linux performance
-results yet.
-
-### Windows 11
-
-1. Download and unzip the latest [Windows release](https://github.com/Don-Chad/ninfer-3090/releases/latest).
-2. Double-click `download-qwen38.bat` to download the model. Interrupted downloads resume.
-3. Double-click one launcher:
+### Single RTX 3090 Launchers (Windows 11)
 
 | Launcher | Best for |
 |---|---|
@@ -63,6 +54,47 @@ results yet.
 
 The API is then available at `http://127.0.0.1:8080/v1`. The Windows archive includes the required
 applications and DLLs.
+
+## Dual RTX 3060 12GB (2x 12GB) & 131K Context Guide & FAQ
+
+### 1. VRAM Architecture & Tensor Split (50:50)
+On two NVIDIA GeForce RTX 3060 12GB cards (Ampere SM86, Total 24 GB VRAM), the Qwen3.8-27B model is split across both GPUs:
+
+| Component | GPU 0 (12GB) | GPU 1 (12GB) | Total (24GB) |
+|---|---:|---:|---:|
+| Model Weights (~14.8 GiB) | ~7.4 GiB | ~7.4 GiB | ~14.8 GiB |
+| KV Cache (131K INT8) | ~3.8 GiB | ~3.8 GiB | ~7.6 GiB |
+| Workspace / CUDA Graphs | ~0.5 GiB | ~0.5 GiB | ~1.0 GiB |
+| **Total Allocated VRAM** | **~11.7 GiB** | **~11.7 GiB** | **~23.4 GiB** |
+
+### 2. Can `--max-concurrency 2` be used with `--max-context 131072`?
+**Yes, absolutely.**
+- **Paged KV Cache**: NInfer uses a shared Paged KV Cache pool. When `--kv-capacity 131072` is set, a shared physical pool of 131,072 tokens (~4.3 GiB) is allocated across the GPUs.
+- **Dynamic Sharing**: In `--max-concurrency 2` mode, two active requests can dynamically share this pool (e.g. 65K + 65K tokens, or 100K + 31K tokens). If only one request is active, it can consume the entire 131K context window.
+- **VRAM Impact**: Increasing concurrency from 1 to 2 only requires ~300–400 MB of extra memory for additional GDN state slots and batch workspaces, keeping total VRAM comfortably around ~20.7 GiB out of 24.0 GiB.
+- **TIP**: 만약 2개의 요청이 "동시에 각각 131K 토큰을 꽉 채워(총 262K)" 사용하는 극단적인 상황까지 VRAM을 최대한 확보하고 싶다면 `--kv-capacity auto`를 지정하면 남는 VRAM 전체(최대 약 170K~180K 토큰 풀)를 자동으로 KV 캐시에 할당합니다.
+
+### 3. Model Download: Docker vs Pre-download
+- **Docker Images do not bundle the ~14.8 GiB model file** by design, keeping the container image small and reusable.
+- **Pre-download on Host**: Run `bash scripts/download-qwen38.sh` (or `download-qwen38.bat` on Windows) on the host machine once.
+- **Volume Mount**: Mount the downloaded folder into the container using `-v "$PWD/models:/workspace/models:ro"`.
+
+### 4. Direct Execution Command (Docker / Linux / Windows)
+
+```bash
+# Dual RTX 3060 12GB - 131K Context, Concurrency 2, MTP3
+ninfer-serve models/qwen3_8_27b.ninfer \
+  --host 0.0.0.0 --port 8080 \
+  --devices 0,1 \
+  --tensor-split 0.5,0.5 \
+  --max-concurrency 2 \
+  --max-context 131072 \
+  --kv-capacity 131072 \
+  --kv-dtype int8 \
+  --spec mtp --draft-tokens 3 --lm-head-draft
+```
+
+---
 
 ## Qwen3.8-27B support and RTX 3090 results
 
