@@ -59,6 +59,7 @@ DeviceBuffer::DeviceBuffer(std::size_t size_bytes) : bytes(size_bytes) {
     void* ptr             = nullptr;
     cudaError_t err       = cudaMalloc(&ptr, bytes);
     if (err == cudaErrorMemoryAllocation) {
+        (void)cudaGetLastError();
         err = cudaMallocManaged(&ptr, bytes, cudaMemAttachGlobal);
     }
     if (err != cudaSuccess) {
@@ -142,6 +143,7 @@ DeviceArena::DeviceArena(std::size_t capacity_bytes) {
     void* ptr             = nullptr;
     cudaError_t err       = cudaMalloc(&ptr, capacity_bytes);
     if (err == cudaErrorMemoryAllocation) {
+        (void)cudaGetLastError();
         err = cudaMallocManaged(&ptr, capacity_bytes, cudaMemAttachGlobal);
     }
     if (err != cudaSuccess) {
