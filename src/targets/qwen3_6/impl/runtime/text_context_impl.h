@@ -678,8 +678,16 @@ void TextContext::ordinary_decode_batch(const Tensor& ids, const Tensor& cache_p
         ops::embedding(ids, *embed_, x, stream);
         NullTap tap;
         run_layers(x, Phase::Verify, tap);
+        int num_devs = 0;
+        (void)cudaGetDeviceCount(&num_devs);
+        if (num_devs >= 2) {
+            cudaSetDevice(1);
+        }
         ops::rmsnorm(x, *final_norm_, kCfg.rms_eps, true, hidden, stream);
         ops::linear(hidden, *lm_head_, logits, stream);
+        if (num_devs >= 2) {
+            cudaSetDevice(0);
+        }
     }
     work_.reset();
 }
@@ -738,9 +746,17 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
         Tensor flat_hidden = hidden.view({kCfg.hidden, columns});
         Tensor flat_logits = logits.view({kCfg.vocab, columns});
         Tensor flat_tokens = target_tokens.view({columns});
+        int num_devs = 0;
+        (void)cudaGetDeviceCount(&num_devs);
+        if (num_devs >= 2) {
+            cudaSetDevice(1);
+        }
         ops::rmsnorm(x, *final_norm_, kCfg.rms_eps, true, flat_hidden, stream);
         ops::linear(flat_hidden, *lm_head_, flat_logits, stream);
         ops::argmax(flat_logits, flat_tokens, kCfg.token_domain, stream);
+        if (num_devs >= 2) {
+            cudaSetDevice(0);
+        }
     }
     work_.reset();
 }
@@ -992,7 +1008,15 @@ void TextContext::mlp_tail(const Tensor* post_norm, const MlpW& m, Tensor& x, Ph
 template <class Tap>
 void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
     const bool prefill = ph == Phase::Prefill;
+    int num_devs = 0;
+    (void)cudaGetDeviceCount(&num_devs);
+    const bool multi_dev = num_devs >= 2;
+    const int split_layer = kCfg.n_layers / 2;
+
     for (int layer = 0; layer < kCfg.n_layers; ++layer) {
+        if (multi_dev) {
+            cudaSetDevice(layer < split_layer ? 0 : 1);
+        }
         if (ModelConfig::is_full(layer)) {
             const int fidx         = ModelConfig::full_idx(layer);
             const FullLayerW& full = full_.at(static_cast<std::size_t>(fidx));
@@ -1036,6 +1060,9 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                 if constexpr (Tap::enabled) { tap.capture_layer(layer, x, ctx_.stream); }
             }
         }
+    }
+    if (multi_dev) {
+        cudaSetDevice(0);
     }
 }
 
@@ -1182,6 +1209,12 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                 tap.capture_positions(positions, s);
             }
 
+            int num_devs = 0;
+            (void)cudaGetDeviceCount(&num_devs);
+            if (num_devs >= 2) {
+                cudaSetDevice(1);
+            }
+
             Tensor xf = prefill_hidden_.data != nullptr
                             ? matrix_window(prefill_hidden_, len)
                             : work_.alloc(DType::BF16, {kCfg.hidden, len});
@@ -1202,6 +1235,9 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                 } else {
                     ops::argmax(logits, io_.token, kCfg.token_domain, s);
                 }
+            }
+            if (num_devs >= 2) {
+                cudaSetDevice(0);
             }
 
             if (prepare_mtp_prompt) {

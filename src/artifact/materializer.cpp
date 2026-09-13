@@ -182,6 +182,26 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
     }
     out.stats_.peak_staging_bytes = static_cast<std::uint64_t>(slot_bytes) * slot_count;
 
+    int num_devices = 0;
+    (void)cudaGetDeviceCount(&num_devices);
+    const bool multi_device = num_devices >= 2;
+    const std::uint64_t split_offset = multi_device ? (capacity / 2ULL) : capacity;
+    void* split_ptr = static_cast<std::byte*>(out.device_arena_->base()) + split_offset;
+
+    cudaStream_t transfer_stream_1 = nullptr;
+    if (multi_device) {
+        (void)cudaMemAdvise(out.device_arena_->base(), split_offset, cudaMemAdviseSetPreferredLocation, 0);
+        (void)cudaMemAdvise(out.device_arena_->base(), split_offset, cudaMemAdviseSetAccessedBy, 0);
+        (void)cudaMemAdvise(split_ptr, capacity - split_offset, cudaMemAdviseSetPreferredLocation, 1);
+        (void)cudaMemAdvise(split_ptr, capacity - split_offset, cudaMemAdviseSetAccessedBy, 1);
+
+        int prev_dev = 0;
+        CUDA_CHECK(cudaGetDevice(&prev_dev));
+        CUDA_CHECK(cudaSetDevice(1));
+        CUDA_CHECK(cudaStreamCreateWithFlags(&transfer_stream_1, cudaStreamNonBlocking));
+        CUDA_CHECK(cudaSetDevice(prev_dev));
+    }
+
     std::size_t next_slot  = 0;
     std::size_t next_range = 0;
     const auto start       = std::chrono::steady_clock::now();
@@ -217,12 +237,17 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
                 const std::uint64_t copy_end   = std::min(chunk_end, range.source_end);
                 if (copy_begin < copy_end) {
                     const auto amount = static_cast<std::size_t>(copy_end - copy_begin);
+                    std::byte* dst_addr = range.destination +
+                                          static_cast<std::size_t>(copy_begin - range.source_begin);
+                    cudaStream_t copy_stream = device.transfer_stream;
+                    if (multi_device && dst_addr >= static_cast<std::byte*>(split_ptr)) {
+                        copy_stream = transfer_stream_1;
+                    }
                     CUDA_CHECK(cudaMemcpyAsync(
-                        range.destination +
-                            static_cast<std::size_t>(copy_begin - range.source_begin),
+                        dst_addr,
                         static_cast<std::byte*>(slot.buffer.data()) +
                             static_cast<std::size_t>(copy_begin - source),
-                        amount, cudaMemcpyHostToDevice, device.transfer_stream));
+                        amount, cudaMemcpyHostToDevice, copy_stream));
                     copied =
                         checked_add(copied, amount, "artifact copied byte count overflows u64");
                 }
@@ -245,6 +270,15 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
     }
     for (const auto& slot : slots) { slot->wait(); }
     CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
+    if (multi_device && transfer_stream_1 != nullptr) {
+        CUDA_CHECK(cudaStreamSynchronize(transfer_stream_1));
+        // Prefetch to respective GPUs to lock into physical VRAM
+        (void)cudaMemPrefetchAsync(out.device_arena_->base(), split_offset, 0, device.transfer_stream);
+        (void)cudaMemPrefetchAsync(split_ptr, capacity - split_offset, 1, transfer_stream_1);
+        CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
+        CUDA_CHECK(cudaStreamSynchronize(transfer_stream_1));
+        CUDA_CHECK(cudaStreamDestroy(transfer_stream_1));
+    }
     if (copied != total || next_range != ranges.size()) {
         throw ArtifactError("direct materialization did not cover every tensor byte");
     }

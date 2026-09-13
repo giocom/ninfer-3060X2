@@ -19,7 +19,7 @@ struct DeviceSpan {
 class DeviceBuffer {
 public:
     DeviceBuffer() noexcept = default;
-    explicit DeviceBuffer(std::size_t size_bytes);
+    explicit DeviceBuffer(std::size_t size_bytes, int device_id = -1);
     ~DeviceBuffer();
 
     DeviceBuffer(const DeviceBuffer&)            = delete;
@@ -34,6 +34,7 @@ public:
     // Raw access is intentional: Tensor and Weight are non-owning views.
     void* p           = nullptr;
     std::size_t bytes = 0;
+    int device_id     = -1;
 
 private:
     void require_range(std::size_t byte_offset, std::size_t count, const char* operation) const;
@@ -59,9 +60,9 @@ public:
         std::size_t saved_offset_ = 0;
     };
 
-    explicit DeviceArena(std::size_t capacity_bytes);
+    explicit DeviceArena(std::size_t capacity_bytes, int device_id = -1);
     // Non-owning arena over an already allocated device region.
-    explicit DeviceArena(DeviceSpan storage);
+    explicit DeviceArena(DeviceSpan storage, int device_id = -1);
     ~DeviceArena();
 
     DeviceArena(const DeviceArena&)            = delete;
@@ -78,6 +79,7 @@ public:
     std::size_t used() const noexcept;
     std::size_t capacity() const noexcept;
     std::size_t peak_used() const noexcept;
+    int device() const noexcept { return device_id_; }
     void reset_peak() noexcept;
 
 private:
@@ -85,6 +87,7 @@ private:
     std::size_t cap_  = 0;
     std::size_t off_  = 0;
     std::size_t peak_ = 0;
+    int device_id_    = -1;
     bool owns_        = true;
 };
 
