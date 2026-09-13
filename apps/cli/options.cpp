@@ -58,6 +58,17 @@ std::vector<int> parse_devices(const char* text) {
     return devices;
 }
 
+float parse_float(const char* text, std::string_view label, float minimum, float maximum) {
+    errno              = 0;
+    char* end          = nullptr;
+    const double value = std::strtod(text, &end);
+    if (errno == ERANGE || end == text || *end != '\0' || !std::isfinite(value) ||
+        value < static_cast<double>(minimum) || value > static_cast<double>(maximum)) {
+        throw std::invalid_argument("invalid " + std::string(label) + ": " + text);
+    }
+    return static_cast<float>(value);
+}
+
 std::vector<float> parse_tensor_split(const char* text) {
     std::vector<float> splits;
     std::string s(text);
@@ -73,17 +84,6 @@ std::vector<float> parse_tensor_split(const char* text) {
     }
     if (splits.empty()) { throw std::invalid_argument("tensor-split list must not be empty"); }
     return splits;
-}
-
-float parse_float(const char* text, std::string_view label, float minimum, float maximum) {
-    errno              = 0;
-    char* end          = nullptr;
-    const double value = std::strtod(text, &end);
-    if (errno == ERANGE || end == text || *end != '\0' || !std::isfinite(value) ||
-        value < static_cast<double>(minimum) || value > static_cast<double>(maximum)) {
-        throw std::invalid_argument("invalid " + std::string(label) + ": " + text);
-    }
-    return static_cast<float>(value);
 }
 
 KvCacheStorage parse_kv_cache(std::string_view text) {
