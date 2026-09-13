@@ -189,11 +189,19 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
     void* split_ptr = static_cast<std::byte*>(out.device_arena_->base()) + split_offset;
 
     cudaStream_t transfer_stream_1 = nullptr;
+    cudaMemLocation loc0{};
+    loc0.type = cudaMemLocationTypeDevice;
+    loc0.id = 0;
+
+    cudaMemLocation loc1{};
+    loc1.type = cudaMemLocationTypeDevice;
+    loc1.id = 1;
+
     if (multi_device) {
-        (void)cudaMemAdvise(out.device_arena_->base(), split_offset, cudaMemAdviseSetPreferredLocation, 0);
-        (void)cudaMemAdvise(out.device_arena_->base(), split_offset, cudaMemAdviseSetAccessedBy, 0);
-        (void)cudaMemAdvise(split_ptr, capacity - split_offset, cudaMemAdviseSetPreferredLocation, 1);
-        (void)cudaMemAdvise(split_ptr, capacity - split_offset, cudaMemAdviseSetAccessedBy, 1);
+        (void)cudaMemAdvise(out.device_arena_->base(), split_offset, cudaMemAdviseSetPreferredLocation, loc0);
+        (void)cudaMemAdvise(out.device_arena_->base(), split_offset, cudaMemAdviseSetAccessedBy, loc0);
+        (void)cudaMemAdvise(split_ptr, capacity - split_offset, cudaMemAdviseSetPreferredLocation, loc1);
+        (void)cudaMemAdvise(split_ptr, capacity - split_offset, cudaMemAdviseSetAccessedBy, loc1);
 
         int prev_dev = 0;
         CUDA_CHECK(cudaGetDevice(&prev_dev));
@@ -273,8 +281,8 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
     if (multi_device && transfer_stream_1 != nullptr) {
         CUDA_CHECK(cudaStreamSynchronize(transfer_stream_1));
         // Prefetch to respective GPUs to lock into physical VRAM
-        (void)cudaMemPrefetchAsync(out.device_arena_->base(), split_offset, 0, device.transfer_stream);
-        (void)cudaMemPrefetchAsync(split_ptr, capacity - split_offset, 1, transfer_stream_1);
+        (void)cudaMemPrefetchAsync(out.device_arena_->base(), split_offset, loc0, 0, device.transfer_stream);
+        (void)cudaMemPrefetchAsync(split_ptr, capacity - split_offset, loc1, 0, transfer_stream_1);
         CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
         CUDA_CHECK(cudaStreamSynchronize(transfer_stream_1));
         CUDA_CHECK(cudaStreamDestroy(transfer_stream_1));
