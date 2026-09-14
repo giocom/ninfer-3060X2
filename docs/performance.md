@@ -1,4 +1,4 @@
-# Single-GPU serving performance
+# Serving performance
 
 Tested Git revisions:
 
@@ -28,6 +28,10 @@ Qwen3.8-27B NVFP4 campaign covers the MTP0 long-context profile and the complete
 speculative-decode corpus at C=1, 2, 4, and 8; its C=1 point also supplies the single-request MTP3
 results below. The registered Qwen3.8-27B `groupwise-int` profile remains outside the published
 benchmark campaign.
+
+Every campaign above and below is single-GPU except **Dual-GPU (TP2) and YaRN 1M context**, which
+is measured across two RTX 5090s and under a power limit the single-GPU campaigns were not; the two
+sets are not comparable to each other.
 
 The single-request corpus requests were submitted serially to a persistent `ninfer-serve` process
 over the loopback OpenAI-compatible HTTP endpoint. Each reported corpus fixture used five fixed
@@ -160,6 +164,309 @@ All 45 requests reached their output limit, producing 368,640 completion tokens.
 contained 608 complete full-batch steady intervals and had no request, CUDA, or out-of-memory
 failure. At C=8, available device memory after startup was 2.66 GiB for 27B groupwise-int,
 2.18 GiB for 27B NVFP4, and 4.38 GiB for 35B-A3B.
+
+## Dual-GPU (TP2) and YaRN 1M context
+
+This section is the only dual-GPU campaign in this document. It was measured on the Qwen3.8-27B
+NVFP4 artifact across two RTX 5090s with `--tp 2 --devices 0,1`, INT8 group-64 KV, CUDA Graphs
+enabled, and greedy decoding. The extended-context rows additionally use
+`--rope yarn --yarn-factor 4.0 --yarn-origin 262144`.
+
+**Power condition.** The campaign was measured with both GPUs held at a **400 W per-GPU cap** --
+the minimum settable limit on these cards; the vendor defaults on the measurement host are 600 W
+and 575 W, and the maximum is 600 W on both. Sampled draw sat at 346-353 W against the cap, so the
+limit was binding. The publishable subset was then **re-measured with both cards at 575 W**, and
+the tables below carry both conditions. Lifting the cap helps `--tp 1` considerably more than
+`--tp 2`: one card running the whole model saturates its limit (peak sampled draw 575.5 W) while
+two cards sharing it peak at 391 and 406 W, so the TP2-over-TP1 decode advantage narrows from
+1.44x to 1.40x. Never quote a figure from this section without its power condition. The single-GPU
+campaigns above were measured under neither condition and are not comparable to these rows.
+
+### Method
+
+| Setting | Value |
+|---|---|
+| GPUs | 2 x NVIDIA GeForce RTX 5090, 32 GiB, no NVLink, peer-to-peer unavailable |
+| Power limit | 400 W per GPU (campaign) and 575 W per GPU (re-measurement); vendor defaults 600 W / 575 W, maximum 600 W on both cards |
+| Artifact | Qwen3.8-27B NVFP4 |
+| Tensor parallel | `--tp 2 --devices 0,1` |
+| KV cache | INT8 group-64 |
+| CUDA Graph | Enabled |
+| Prefill chunk | 1,024 tokens |
+| Sampling | Greedy (exact argmax) unless a row states otherwise |
+| Rope | `native` at 262k; `yarn` factor 4.0, origin 262,144 above it |
+| MTP3 | `--spec mtp --draft-tokens 3 --lm-head-draft` |
+
+### Single request, matched 249,955-token prompt
+
+Byte-identical prompt on both widths, 512 generated tokens. TP1 ran at `--max-context 252928`,
+the largest window that fits one card after weights; TP2 ran at the full `262144`.
+
+| Metric | TP1 @400 W | TP2 @400 W | TP2/TP1 | TP1 @575 W | TP2 @575 W | TP2/TP1 |
+|---|---:|---:|---:|---:|---:|---:|
+| Prefill tok/s | 2,269.8 | 2,680.1 | 1.18x | 2,484.2 | 2,787.0 | 1.12x |
+| Decode tok/s, MTP off | 52.35 | 75.18 | 1.44x | 53.95 | 75.32 | 1.40x |
+| Decode tok/s, MTP3 | 101.7 | 152.1 | 1.50x | 113.60 | 159.39 | 1.40x |
+| MTP3 draft acceptance | 50.83% | 57.96% | 1.14x | 50.83% | 57.96% | 1.14x |
+| Time to first token, s | 111.0 | 93.7 | 0.84x | 101.0 | 90.0 | 0.89x |
+| Per-GPU resident memory | 27.90 GiB (one card) | 15.04 GiB (each card) | | 27.90 GiB | 15.04 GiB | |
+| Peak sampled draw, MTP off | — | — | | 575.5 W | 390.9 / 405.7 W | |
+| Peak sampled draw, MTP3 | — | — | | 575.8 W | 483.8 / 444.5 W | |
+
+Draft acceptance is identical to four decimal places across the two power conditions (0.5083 and
+0.5796), which is the expected result: power changes timing, not arithmetic.
+
+On a 536-token reasoning prompt the same comparison is 152.0 to 189.5 decode tok/s and 56.61% to
+58.06% acceptance. TP1 wins short-prompt prefill (7,582 versus 5,451 tok/s at 8,147 tokens), where
+the cross-device collectives are not amortized by a long chunked prefill. **Both of these
+short-prompt comparisons were measured at the 400 W per-GPU cap only** and were not re-measured at
+575 W, so they must not be read against the 575 W rows above.
+
+### Saturated concurrent decode at a 262,144-token window
+
+One server per concurrency point, `--decode-tokens 8192`, stochastic sampling, aggregate committed
+decode tok/s over complete full-batch intervals.
+
+| Concurrency | MTP off @400 W | Speedup | MTP3 @400 W | Speedup | MTP off @575 W | MTP3 @575 W |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 93.5 | 1.00x | 172.4 | 1.00x | 94.1 | 177.8 |
+| 2 | 183.0 | 1.96x | 287.0 | 1.67x | not re-measured | not re-measured |
+| 4 | 314.3 | 3.36x | 466.0 | 2.70x | 320.3 (3.40x) | 475.2 (2.67x) |
+
+MTP raises absolute throughput at every point while scaling less steeply from batching, which is
+consistent with its single-lane throughput already sitting closer to the ceiling batching pushes
+toward. Engine-accounted per-GPU memory at C=4 was 14.97 GiB (MTP off) and 15.64 GiB (MTP3).
+
+### Extended context, single request
+
+Served from one `ninfer-serve` process at `--max-context 1048576 --max-concurrency 1`. Prefill and
+decode are the server's own phase timings.
+
+| Prompt tokens | MTP | Power | Prefill tok/s | Prefill wall | Decode tok/s |
+|---:|---|---|---:|---:|---:|
+| 8,146 | off | 400 W | 5,517.5 | 1.5 s | 97.89 |
+| 652,954-652,955 | off | 400 W | 1,348.4 | 484.2 s | 58.22 |
+| 652,954-652,955 | off | 400 W (re-run) | 1,379.5 | 470.7-476.0 s | 58.69 |
+| 1,045,954-1,045,955 | off | 400 W | 928.9 | 1,126.0 s (18.8 min) | 46.39 |
+| 1,045,954-1,045,955 | off | 575 W | 975.1 | 1,072.6 s (17.9 min) | 48.08 |
+| 1,045,954 | off, 512 generated | 575 W | 971.4 | 1,076.7 s | 46.11 |
+| 1,045,954 | MTP3, 512 generated | 575 W | 975.0 | 1,072.7 s | 100.54 at 56.41% acceptance |
+| 949,885 | off | 400 W | 1,011.89 | 938.7 s | 45.49 |
+| 949,885 | MTP3 | 400 W | 1,010.19 | — | 99.51 at 58.65% acceptance |
+
+The two 512-generated-token rows are a **like-for-like** MTP measurement: same prompt, same window,
+same token budget, so their ratio -- **2.18x** -- needs none of the cross-window caveat the
+949,885-token pair in the same table carries. The 24-token rows are needle requests, whose decode
+average starts and ends at a lower position. The 400 W and "400 W (re-run)" rows at 652,954 tokens
+are two measurements of the same configuration under the same power condition, taken three days
+apart; the 653k tier was not re-measured at 575 W.
+
+Ten 653k requests spread 0.3% in prefill rate and ten 1M requests spread 1.4% over a 4.5-hour run:
+no thermal fade and no drift. Decode degrades smoothly with context rather than falling off a
+cliff, but the decode split policy was tuned at 262k and has not been swept at 1M.
+
+At ~950k tokens MTP3 reaches 99.51 tok/s at 58.65% acceptance on non-repeating greedy text
+(400 W). That comparison against 45.49 tok/s was cross-window -- its denominator averaged a decode
+from ~950k to the 1,048,576 ceiling while its numerator decoded only ~950k to ~962k -- and it was
+quoted as "about 2.2x" for that reason. The like-for-like pair in the table above settles it:
+**100.54 against 46.11 tok/s = 2.18x**, same prompt, same window, same 512-token budget, at 575 W.
+Acceptance is flat across context: 57.96% at 250k, 58.65% at ~950k, 56.41% at 1,046k.
+
+Two figures from the same run are reported separately and must not be quoted as the headline: a
+repetitive greedy stream reaches 93.54% acceptance and 135.78 tok/s, and a
+temperature-0.8 sampled stream 80.36% and 122.21 tok/s. Sampled and greedy acceptance are different
+algorithms, and the repetitive figure is a loop artifact. Two different degeneration mechanisms
+produce those loops: the MTP-off soak stream repeats whole turns because `--ignore-eos` suppresses
+its end-of-turn token, while the MTP3 greedy stream contains no end-of-turn token at all and
+collapses into a 187-token content-level loop whose first repeat begins at generated index 1,201.
+(The 1,341-token acceptance row above is a suffix-period cut, `12,000 - 57 x 187`, not the loop
+onset; about 140 of its tokens sit inside the loop's first block, so 58.65% is a mild upper bound
+on the novel-text figure.) Sampled decoding at temperature 0.8 does not loop.
+
+### Memory, per GPU
+
+`Resident` is `nvidia-smi` per-process memory. It was flat across every sample of every run: a 1M
+prefill adds nothing to the residency chosen at load, and the workspace peaked at 112.29 MiB inside
+a 182.81 MiB reservation during a 949,863-token prefill.
+
+| Context | MTP | Weights | Sequence | Workspace | Reserved | Resident |
+|---:|---|---:|---:|---:|---:|---:|
+| 262,144 | off | 10.08 GiB | 4.28 GiB | 0.18 GiB | — | 15.04 GiB |
+| 262,144 | MTP3 | 10.46 GiB | 4.54 GiB | 0.19 GiB | — | 15.69 GiB |
+| 1,048,576 | off | 10.08 GiB | 16.66 GiB | 182.81 MiB | 26.93 GiB | 27.41 GiB |
+| 1,048,576 | MTP3 | 10.46 GiB | 17.69 GiB | 192.93 MiB | 28.42 GiB | 28.84 GiB |
+
+`Reserved` is the CLI load summary's per-device row; the 262,144-token rows were measured through
+`ninfer-serve`'s startup record and `nvidia-smi` instead. The gap of about 0.48 GiB between
+`Reserved` and `Resident` is the CUDA context and driver-side allocations the planner does not
+count, so the summary's `planned slack` over-reports free memory by that much. CUDA Graph residency
+at 1M was 2.00-3.00 MiB per device against a 20.00 MiB allowance.
+
+Turning MTP3 on costs a measured 1.49 GiB of reserved memory per device at 1,048,576 tokens and
+0.65 GiB at 262,144. Its two dominant terms are 0.38 GiB of head weights, fixed at any window, and
+1.03 GiB of MTP KV per 1M tokens of window; the remainder of each measured delta is workspace and
+sequence-arena rounding. At 1M with MTP3 the margin to a 30 GiB per-device budget is 1.16 GiB.
+
+### Reproduction
+
+The dual-GPU campaign is driven by the same concurrency runner as the single-GPU tables, with the
+tensor-parallel flags added:
+
+```bash
+python3 tools/bench/run_serve_concurrency.py \
+  --serve build/apps/ninfer-serve \
+  --artifact qwen3_8_27b=out/qwen3_8_27b_nvfp4.ninfer \
+  --mode mtp3 --suite decode-saturation --concurrency 1 --concurrency 2 --concurrency 4 \
+  --tp 2 --devices 0,1 --device 0 \
+  --max-context 262144 --kv-capacity 262144 \
+  --output profiles/bench/tp2_decode_saturation
+```
+
+The extended-context rows are single requests against a server started with the 1M configuration:
+
+```bash
+./build/apps/ninfer-serve out/qwen3_8_27b_nvfp4.ninfer \
+  --tp 2 --devices 0,1 \
+  --rope yarn --yarn-factor 4.0 --yarn-origin 262144 \
+  --max-context 1048576 --kv-capacity auto --kv-dtype int8 \
+  --max-concurrency 1 --prefill-chunk 1024 \
+  --request-log-jsonl run.requests.jsonl
+```
+
+Read prefill and decode from that log's `request_done.timings_seconds`, and confirm the power
+condition with `nvidia-smi --query-gpu=power.limit,power.default_limit,power.draw --format=csv`
+before quoting any figure.
+
+### Cross-engine comparison against vLLM (NVFP4, 500 W per GPU)
+
+This comparison is a **third power condition**: both cards capped at **500 W per GPU**, distinct
+from the 400 W campaign and the 575 W re-measurement above. Rows from the three conditions are not
+comparable with each other.
+
+One request at a time, byte-identical needle-in-a-haystack prompts at three context tiers, 512
+output tokens, temperature 0, thinking off, and a freshly booted server per tier on both sides so
+that every prefill is genuinely cold -- zero prefix-cache hits, verified from each engine's own
+counters. `Prefill tok/s` is `prompt_tokens / TTFT`; `decode tok/s` is measured client-side over
+the streamed window. `Peak VRAM/GPU` is the peak the engine's own process held on each device, and
+peak draw comes from a 3 s sampler. Every row below was taken at the 500 W per-GPU cap.
+
+| Engine | Window served | Tier | MTP | Prompt tokens | TTFT (s) | Prefill tok/s | Decode tok/s | Total (s) | Peak VRAM/GPU | Peak draw (GPU0 / GPU1) |
+|---|---:|---|---|---:|---:|---:|---:|---:|---:|---|
+| vLLM 0.25.1 | 750,000 | 250k | MTP3 | 249,955 | 79.14 | **3,158.5** | 110.78 | 83.75 | 28.90 GiB | 443.9 / 467.6 W |
+| vLLM 0.25.1 | 750,000 | 653k | MTP3 | 652,955 | 353.84 | **1,845.3** | 41.94 | 366.03 | 29.00 GiB | 473.6 / 496.4 W |
+| vLLM 0.25.1 | 750,000 | 700k | MTP3 | 699,955 | 402.56 | **1,738.8** | 41.01 | 415.02 | 28.90 GiB | 475.3 / 497.7 W |
+| NInfer TP2 | 1,048,576 | 250k | off | 249,955 | 92.56 | 2,700.5 | 73.35 | 99.51 | 27.41 GiB | 385.2 / 396.8 W |
+| NInfer TP2 | 1,048,576 | 250k | MTP3 | 249,955 | 91.66 | 2,726.9 | **155.80** | 94.93 | 28.84 GiB | 380.9 / 373.6 W |
+| NInfer TP2 | 1,048,576 | 653k | off | 652,955 | 465.82 | 1,401.7 | 56.70 | 474.81 | 27.41 GiB | 414.1 / 440.0 W |
+| NInfer TP2 | 1,048,576 | 653k | MTP3 | 652,955 | 471.01 | 1,386.3 | **118.74** | 475.28 | 28.84 GiB | 475.3 / 488.1 W |
+| NInfer TP2 | 1,048,576 | 700k | off | 699,955 | 529.26 | 1,322.5 | 54.84 | 538.55 | 27.41 GiB | 415.2 / 458.8 W |
+| NInfer TP2 | 1,048,576 | 700k | MTP3 | 699,955 | 532.42 | 1,314.7 | **103.42** | 537.33 | 28.84 GiB | 465.0 / 463.0 W |
+
+vLLM 0.25.1 served `unsloth/Qwen3.8-27B-NVFP4` at `--tensor-parallel-size 2` with FP8 KV, YaRN x4
+injected through `--hf-overrides`, `--max-model-len 750000`, `--max-num-batched-tokens 16768`,
+FlashInfer, and `--speculative-config '{"method":"mtp","num_speculative_tokens":3}'`. Its
+speculative configuration is fixed at launch, so all three of its rows are MTP3. NInfer served its
+own NVFP4 artifact at `--tp 2 --rope yarn --yarn-factor 4.0 --yarn-origin 262144
+--max-context 1048576 --kv-dtype int8 --prefill-chunk 1024`.
+
+The two engines counted **identical prompt token totals at every tier** -- 249,955 / 652,955 /
+699,955, each server tokenizing the same prompt string independently. That is the evidence that
+they were given the same input.
+
+**Prefill goes to vLLM at every tier**, by 1.17x at 250k, 1.32x at 653k and 1.32x at 700k:
+3,158.5 / 1,845.3 / 1,738.8 tok/s against NInfer's 2,700.5 / 1,401.7 / 1,322.5. The most likely
+single cause is prefill chunking -- vLLM batches up to 16,768 tokens per prefill step, NInfer
+1,024 -- and that is a tunable rather than a ceiling. It was not swept.
+
+**Decode goes to NInfer, and the cause is vLLM's speculative acceptance past its native window.**
+That deployment's native window is 262,144 tokens; beyond it, its MTP head still drafts 3 tokens
+per step and has every one rejected. Acceptance measured from each engine's own counters, for
+exactly the requests in the table:
+
+| Tier | vLLM drafted / accepted | vLLM acceptance | NInfer drafted / accepted | NInfer acceptance |
+|---|---:|---:|---:|---:|
+| 250k | 606 / 311 | 51.3% | 567 / 322 | 56.8% |
+| 653k | 1,533 / **0** | **0.0%** | 547 / 328 | 60.0% |
+| 700k | 1,533 / **0** | **0.0%** | 602 / 310 | 51.5% |
+
+So vLLM pays the drafter's cost for nothing at 653k and 700k, and its decode falls to 41.94 and
+41.01 tok/s. NInfer's acceptance is flat across the same range, and its MTP3 decode is **2.83x and
+2.52x** vLLM's there (118.74 and 103.42 tok/s). NInfer's MTP-*off* decode at those tiers (56.70 and
+54.84 tok/s) already beats vLLM's speculative decode. At 250k, where vLLM's speculation still
+works, vLLM decodes 110.78 tok/s against NInfer's 155.80 with MTP3 and 73.35 with MTP off.
+
+**Context ceiling and memory.** vLLM's KV pool measured 759,297 tokens at boot (12.73 GiB, FP8,
+`--gpu-memory-utilization 0.85`), with 28.90-29.00 GiB held per GPU. NInfer holds 1,048,576 tokens
+-- 38% more window -- in 27.41 GiB per GPU with MTP off and 28.84 GiB with MTP3. The 700k tier sits
+near vLLM's ceiling and comfortably inside NInfer's. A second boot of the same vLLM configuration
+measured 760,847 tokens; the pool varies by about 0.2% between boots with the free-memory profile
+at launch.
+
+**End to end at 512 output tokens, vLLM finishes first at every tier**, because a request of that
+shape is almost entirely prefill. NInfer's decode advantage repays its slower prefill beyond
+roughly **4,800 output tokens at 250k, 7,600 at 653k and 8,800 at 700k** (NInfer MTP3 against
+vLLM). The Qwen3.8 card's own guidance for a 1M window -- up to 262k tokens of reasoning and 131k
+of final response on agentic tasks -- sits far above all three break-even points.
+
+#### Caveats on the cross-engine rows
+
+- **Different weights.** vLLM served `unsloth/Qwen3.8-27B-NVFP4`, an NVFP4 quantization of the base
+  Qwen3.8-27B fine-tune; NInfer served its own conversion of the huihui abliterated fine-tune.
+  These are different quantizations of different fine-tunes. The comparison is *engine plus
+  quantization pipeline*, not a controlled same-weights benchmark. Architecture, layer count and
+  hidden sizes are identical, so the prefill and decode arithmetic has the same shape, but nothing
+  here isolates the engine from the checkpoint.
+- **Different KV dtypes.** vLLM FP8, NInfer INT8. That affects both the memory rows and attention
+  bandwidth, so it is present in both the prefill and the decode columns.
+- **Different prefill chunking, unswept.** vLLM `--max-num-batched-tokens 16768` against NInfer
+  `--prefill-chunk 1024`, the value the 1M configuration ships with. Neither was swept.
+- **No vLLM MTP-off row.** Speculative decoding is fixed at launch and turning it off needs a
+  restart with a different `--speculative-config`; that run was not made. vLLM's 653k and 700k rows
+  are therefore MTP-off *behaviour* at MTP-on *cost*, which is worse than a true MTP-off run would
+  be.
+- **No quality claim.** Both engines ran at `temperature 0`, `seed 42`, 512 max tokens, but their
+  rejection-sampling paths under speculative decoding are not guaranteed identical and no
+  token-level equivalence was checked. This is a throughput comparison only.
+- **n = 1 per cell.** Each row is a single request.
+- **The 500 W NInfer 250k rows are not a like-for-like re-run of the 575 W 250k rows.** These ran
+  YaRN at a 1,048,576-token window, to match vLLM's YaRN deployment; the 575 W rows ran native rope
+  at 262,144. The roughly 2% difference between them combines the lower cap with the window change
+  and does not separate the two.
+- **The vLLM client needed a wrapper.** That server runs `--reasoning-parser qwen3`, which routes
+  output to `delta.reasoning_content`, and it ignores a top-level `enable_thinking` field (its
+  equivalent is `chat_template_kwargs`). The project probe reads `delta.content` and sends the
+  top-level field, so the vLLM rows were taken with a wrapper client that times the first delta on
+  either channel and sends `chat_template_kwargs={"enable_thinking": false}`. Every vLLM row
+  reports its tokens arriving on the `content` channel, so thinking was off on both sides.
+
+Two further points about vLLM's extended context, independent of the table:
+
+- **Extended context in vLLM is a checkpoint property, not a serving flag.** An NVFP4 repackaging
+  that ships without a YaRN block in `config.json` `rope_parameters` is capped at its
+  `max_position_embeddings` (262,144) until one is injected at load. `--hf-overrides` does exactly
+  that, and vLLM then serves this checkpoint far beyond 262,144 tokens. The difference from NInfer
+  is **where the configuration lives** -- a serving flag on an unmodified artifact here, a
+  checkpoint-config override there -- not a capability difference.
+- **A prefix-cache measurement, not a comparison row.** One extra vLLM run replayed the identical
+  250k prompt on the same server: 248,000 of 249,955 tokens served from the prefix cache (99.22%),
+  TTFT 1.80 s instead of 79.14 s, decode unchanged at 108.75 tok/s.
+
+The raw probe records, per-request server logs, power and VRAM samples, speculative counters and
+the full methodology are committed under
+[`eval/results/cross-engine-nvfp4/`](../eval/results/cross-engine-nvfp4/README.md).
+
+### Measurement gaps in this campaign
+
+- **Concurrency C=2 was measured at the 400 W cap only**; the 575 W re-measurement covered C=1 and
+  C=4, and the 653k extended-context tier was not re-measured at 575 W.
+- **The soak is greedy only.** A seeded temperature > 0 soak, as the decode-coverage complement, has
+  not been run.
+- **The cross-engine comparison has no vLLM MTP-off row**, because speculative decoding is fixed at
+  vLLM's launch and that restart was not made, and **the prefill-chunk difference was not swept** on
+  either engine (`--prefill-chunk 1024` against `--max-num-batched-tokens 16768`).
+
+The design decisions and correctness gates behind these numbers are in
+[Dual-GPU (TP2) execution and YaRN 1M context](maintainer/tp2-yarn-1m.md).
 
 ## Reproduction
 

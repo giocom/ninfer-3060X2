@@ -114,6 +114,74 @@ __device__ __forceinline__ void apply_rope_head(__nv_bfloat16* data, std::int64_
         __floats2bfloat162_rn(second.x * c0 + first.x * s0, second.y * c1 + first.y * s1);
 }
 
+// YaRN text rope. Deliberately a separate kernel rather than a mode/flag inside
+// rope_fixed_kernel: the constant-table path above must keep emitting exactly the instructions it
+// emits today (the tp1 gate is a bit-identity gate), and the only way to guarantee that is to
+// leave its source, its parameter list, and therefore its codegen alone.
+//
+// Differences from rope_fixed_kernel's Text1D/TextMrope instantiations, and only these:
+//   * the per-pair inverse frequency comes from `inv_frequency` (a device buffer of Half floats)
+//     instead of kTextRopeInvFrequency;
+//   * cos and sin are both multiplied by `mscale` before the rotation. That is where vLLM puts it
+//     (`YaRNScalingRotaryEmbedding._compute_cos_sin_cache`: `cos = freqs.cos() * mscale;
+//     sin = freqs.sin() * mscale`), and because the same shared cache serves every q and k head
+//     (`MRotaryEmbedding.forward` applies one (cos, sin) pair to query_rot and key_rot alike),
+//     the rotary subspace of q.k picks up mscale^2 while the 192 pass-through dimensions of the
+//     256-wide head are untouched;
+//   * head counts are runtime arguments, so one instantiation serves both the whole-model
+//     geometries (24Q/4K, 16Q/2K) and the tp2 head-local shards (12Q/2K, 8Q/1K) as well as every
+//     single-tensor head count. The loop bound is the only thing that was compile-time above.
+template <RopeKernelMode Mode>
+__global__ void rope_yarn_text_kernel(const std::int32_t* positions, __nv_bfloat16* q,
+                                      __nv_bfloat16* k, std::int32_t q_heads, std::int32_t k_heads,
+                                      std::int32_t tokens, std::int64_t q_token_stride,
+                                      std::int64_t k_token_stride, const float* inv_frequency,
+                                      float mscale) {
+    static_assert(Mode == RopeKernelMode::Text1D || Mode == RopeKernelMode::TextMrope);
+    constexpr int kHeadDim = 256;
+    constexpr int kHalf    = 32;
+    const int token        = static_cast<int>(blockIdx.x);
+    if (token >= tokens) { return; }
+
+    __shared__ float cos_cache[kHalf];
+    __shared__ float sin_cache[kHalf];
+    if (threadIdx.x < kHalf) {
+        const int pair    = static_cast<int>(threadIdx.x);
+        const int axis    = Mode == RopeKernelMode::TextMrope ? pair % 3 : 0;
+        const float angle =
+            static_cast<float>(positions[static_cast<std::int64_t>(axis) * tokens + token]) *
+            inv_frequency[pair];
+        float sine   = 0.0F;
+        float cosine = 0.0F;
+        sincosf(angle, &sine, &cosine);
+        sin_cache[pair] = sine * mscale;
+        cos_cache[pair] = cosine * mscale;
+    }
+    __syncthreads();
+
+    const int lane        = static_cast<int>(threadIdx.x) & 31;
+    const int warp        = static_cast<int>(threadIdx.x) >> 5;
+    const int block_warps = static_cast<int>(blockDim.x) >> 5;
+    float c0 = 0.0F, c1 = 0.0F, s0 = 0.0F, s1 = 0.0F;
+    if (lane < kHalf / 2) {
+        const int pair = lane * 2;
+        c0             = cos_cache[pair];
+        c1             = cos_cache[pair + 1];
+        s0             = sin_cache[pair];
+        s1             = sin_cache[pair + 1];
+    }
+    for (int combined_head = warp; combined_head < q_heads + k_heads;
+         combined_head += block_warps) {
+        if (combined_head < q_heads) {
+            apply_rope_head<kHeadDim, kHalf>(q, q_token_stride, combined_head, token, lane, c0, c1,
+                                             s0, s1);
+        } else {
+            apply_rope_head<kHeadDim, kHalf>(k, k_token_stride, combined_head - q_heads, token,
+                                             lane, c0, c1, s0, s1);
+        }
+    }
+}
+
 template <RopeKernelMode Mode, int QHeads, int KHeads>
 __global__ void rope_fixed_kernel(const std::int32_t* positions, __nv_bfloat16* q, __nv_bfloat16* k,
                                   std::int32_t tokens, std::int64_t q_token_stride,

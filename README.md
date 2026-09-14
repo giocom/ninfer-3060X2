@@ -1,363 +1,678 @@
-# NInfer-3090 / Dual RTX 3060 (2x 12GB)
+# NInfer
 
-NInfer is a specialized C++20/CUDA inference engine for **Qwen3.8-27B** and Qwen3.6 on NVIDIA Ampere (SM86) GPUs, including **1x RTX 3090 (24 GB)** and **2x RTX 3060 (12 GB x 2 = 24 GB)**. Qwen3.8-27B is a first-class, tested target: the native SM86 runtime loads its official groupwise `.ninfer` artifact, serves OpenAI- and Anthropic-compatible APIs, and supports multi-GPU tensor split (`--tensor-split 0.5,0.5`), paged KV, compatible-prefix reuse, CUDA Graphs, MTP speculative decoding, reasoning-effort control, ReplaySSM state transactions, and context lengths exceeding **131K tokens**.
+> Selected checkpoints. Maximum single-GPU inference performance, plus a two-GPU path to a
+> 1,048,576-token context.
 
-Community project, maintained on a best-effort basis. Issues and PRs are very welcome, but support
-and feature requests are not guaranteed.
+NInfer is a from-scratch C++/CUDA inference engine for explicitly registered Qwen checkpoints on a
+single NVIDIA GeForce RTX 5090. It runs text, image, and video prompts through a local CLI or
+OpenAI-/Anthropic-compatible HTTP APIs. The 27B execution package additionally runs tensor-parallel
+across two RTX 5090s and, with YaRN positional scaling, serves contexts up to 1,048,576 tokens --
+see [Dual-GPU (TP2) and YaRN 1M context](#dual-gpu-tp2-and-yarn-1m-context).
 
-On Dual RTX 3060 12GB (or an RTX 3090), Qwen3.8-27B supports a measured **131K~171K-token INT8 context** with the standard 1 GiB safety headroom.
+> **This is a fork.** Upstream is [Neroued/ninfer](https://github.com/Neroued/ninfer); this tree
+> branches from its commit `feaf4dd` and adds two things to the 27B execution package. **Dual-GPU
+> tensor parallelism** (`--tp 2 --devices A,B`) halves per-card weight and KV residency and is
+> ~40% faster at long context — one resident model, one process, two devices, no NVLink and no
+> distributed serving. **YaRN ×4 positional scaling** (`--rope yarn`) raises the addressable
+> ceiling from the registered 262,144 tokens to 1,048,576, computed to match vLLM as deployed and
+> guarded by a drift test against the installed vLLM. Everything else is upstream's:
+> `--tp 1` output is byte-identical to `feaf4dd` on the greedy cases in
+> [`tests/data/tp1-golden/`](tests/data/tp1-golden/MANIFEST.md), and single-GPU behaviour,
+> supported identities, artifact format, and protocol surfaces are unchanged. The design
+> decisions, numerical contracts, and qualification evidence behind both features are in
+> [Dual-GPU (TP2) execution and YaRN 1M context](docs/maintainer/tp2-yarn-1m.md).
+> See [NOTICE](NOTICE) for attribution.
 
-> **RotorQuant `rk8v4` is temporarily unavailable.** Upstream moved KV quantization out of the
-> fused GQA attention kernels into a dedicated `kv_cache_append` Op whose contract defines K
-> rotation as H256 and V as unrotated BF16. The rk8v4 int4-V representation has not been ported
-> to that contract yet, so `--kv-dtype rk8v4` is rejected at startup. The previously published
-> 226K/248K RotorQuant context figures do not apply to this build. INT8 remains the default and
-> recommended quantized profile.
+NInfer deliberately supports a closed set of model artifacts instead of acting as a general model
+runtime:
 
-This fork targets `sm_86`. Blackwell-only NVFP4/W4A4 and FP8 A8 tensor-core execution are
-unavailable. FP8 and NVFP4 *weights* are admitted through their A16 dequantizing routes, but the
-FP8 E4M3 *KV-cache* profile is not: its attention kernels have no SM86 implementation. 
+| Model | Weights | NInfer artifact | Size | SHA-256 |
+|---|---|---|---:|---|
+| [Qwen3.6-27B](https://huggingface.co/neroued/Qwen3.6-27B-NInfer) | `groupwise-int` | `qwen3_6_27b.ninfer` | 17,495,365,888 bytes (16.29 GiB) | `7b51600ffd10632b9660f56085efdd9b751d79733ad32036a652234b64bebe7b` |
+| [Qwen3.6-27B NVFP4](https://huggingface.co/neroued/Qwen3.6-27B-nvfp4-NInfer) | `nvfp4` | `qwen3_6_27b_nvfp4.ninfer` | 18,324,064,000 bytes (17.07 GiB) | `bce5f00d066c0f20f1317bf1fdcb458264cf95837c3b1f3fbec163694627893a` |
+| [Qwen3.8-27B](https://huggingface.co/neroued/Qwen3.8-27B-NInfer) | `groupwise-int` | `qwen3_8_27b.ninfer` | 18,210,531,328 bytes (16.96 GiB) | `eec39564993d6e9c7d5e383382a760f093465c9d163ec9a1bd6b80199514bf3e` |
+| [Qwen3.8-27B NVFP4](https://huggingface.co/neroued/Qwen3.8-27B-nvfp4-NInfer) | `nvfp4` | `qwen3_8_27b_nvfp4.ninfer` | 21,492,695,040 bytes (20.02 GiB) | `bb3360522a06e136e0367f5703414d26272b7285c8a6ab6194135c17dbd81b32` |
+| [Qwen3.6-35B-A3B](https://huggingface.co/neroued/Qwen3.6-35B-A3B-NInfer) | `groupwise-int` | `qwen3_6_35b_a3b.ninfer` | 22,783,246,080 bytes (21.22 GiB) | `1fb9ea0b5b8561e49d9604115ec89e5d9f2b6f6434e32c37c57fffd480a325d2` |
 
-The goal is to make the utmost rippin Qwen inference stack for the 3000 series (including RTX 3090 and Dual RTX 3060 12GB). Gladly taking PR's, all help much appreciated. 
+Qwen3.6-27B and Qwen3.8-27B each expose two registered weight profiles. The version-2 artifact
+identity selects the profile without a separate runtime flag; Qwen3.8 uses target key
+`qwen3_8_27b` while sharing the 27B execution package. The Qwen3.6 `nvfp4` profile uses W4A4 Tensor
+Core MMA for prefill and A16 NVFP4 kernels for decode. The Qwen3.8 `nvfp4` profile preserves its
+source's mixed allocation: NVFP4 MLP weights in Text layers 0–55 and row-scaled FP8 for the token
+embedding, attention input/output projections, GDN Q/K/V/Z and output projections, output head, and
+remaining MLP weights. All four 27B artifacts retain the same Text, Vision, MTP, prefix-reuse, CLI,
+and serving routes.
 
-Release notes for this branch: [v0.6.1](RELEASE_NOTES_0.6.1.md).
+## Performance
 
-## Choose a platform & hardware
+The published measurements cover the three Qwen3.6 artifact profiles and the Qwen3.8-27B NVFP4
+profile. The Qwen3.8-27B `groupwise-int` profile is supported by current NInfer builds but is not
+yet included in a published benchmark campaign.
 
-| Platform / Setup | Delivery | Guide |
-|---|---|---|
-| Dual RTX 3060 12GB (Windows) | Release archive / Batch scripts | [Dual RTX 3060 Windows Guide](docs/rtx-3060x2-windows.md) |
-| Dual RTX 3060 12GB (Linux) | Source build / Bash scripts | [Linux Full Guide](README_LINUX.md) / [Dual RTX 3060 Linux](docs/rtx-3060x2-linux.md) |
-| RTX 3090 24GB (Windows) | Prebuilt release archive | [Windows guide](docs/rtx-3090-windows.md) |
-| RTX 3090 24GB (Linux) | Docker image or native source build | [Linux Full Guide](README_LINUX.md) / [RTX 3090 Linux](docs/rtx-3090-linux.md) |
+### Concurrent MTP3 decode
 
-### Dual RTX 3060 12GB Launchers (Windows 11)
+Saturated decode was measured on an RTX 5090 with INT8 group-64 KV cache, CUDA Graphs, MTP3, and
+one 8,192-token generation per active request. The values below are aggregate committed decode
+throughput from complete one-second intervals in which the actual decode batch remained equal to
+the configured concurrency. MTP acceptance is aggregated over the complete request wave. Each
+concurrency cell reports `decode tok/s / MTP acceptance`; profiles should be read independently.
 
-1. Double-click `download-qwen38.bat` to download the model artifact.
-2. Launch one of the Dual-GPU scripts:
+| Model profile | C=1 tok/s / accept | C=2 tok/s / accept | C=4 tok/s / accept | C=8 tok/s / accept | C8 / C1 |
+|---|---:|---:|---:|---:|---:|
+| Qwen3.6-27B `groupwise-int` | 185.8 / 68.2% | 247.0 / 69.0% | 309.5 / 68.4% | 535.0 / 68.3% | 2.88× |
+| Qwen3.6-27B `nvfp4` | 202.4 / 69.3% | 399.7 / 71.4% | 699.7 / 69.3% | 1,146.9 / 68.6% | 5.67× |
+| Qwen3.6-35B-A3B `groupwise-int` | 593.0 / 67.2% | 877.7 / 68.2% | 1,166.0 / 69.8% | 1,313.8 / 67.3% | 2.22× |
+| Qwen3.8-27B `nvfp4` | 143.8 / 48.9% | 267.6 / 48.1% | 461.1 / 45.8% | 766.6 / 46.0% | 5.33× |
 
-| Launcher | Best for |
-|---|---|
-| `run-qwen38-3060x2-131k.bat` | **131K+ context** (131,072 tokens), Tensor Split 50:50, INT8 KV |
-| `run-qwen38-c1-3060x2.bat` | One interactive user, lowest latency, up to 64K context |
-| `run-qwen38-c8-3060x2.bat` | Multiple users/agents, aggregate throughput, 8K context |
-| `benchmark-qwen38-3060x2.bat` | Benchmark throughput on Dual RTX 3060 setup |
+At C=8, Qwen3.6-35B-A3B reaches **1,313.8 aggregate decode tok/s**. Qwen3.6-27B NVFP4 reaches
+**1,146.9 tok/s** and **5.67×** its C=1 throughput. Qwen3.8-27B NVFP4 has **45.8–48.9%** MTP
+acceptance, versus **67.2–71.4%** across the other measured profiles, so aggregate committed
+throughput reflects both execution performance and speculative acceptance.
 
-### Single RTX 3090 Launchers (Windows 11)
+### Single-request serving
 
-| Launcher | Best for |
-|---|---|
-| `run-qwen38-c1.bat` | One interactive user, lowest latency, up to 64K context |
-| `run-qwen38-c8.bat` | Multiple users or agents, highest aggregate throughput, 8K context |
-| `run-qwen38-vision.bat` | Qwen3.8 image understanding, one user, 32K context, MTP3 |
-| `run-qwen36-35b-vision.bat` | Image understanding with Qwen3.6-35B-A3B, one user, 32K context |
+The single-request corpus was measured on the same GPU with INT8 group-64 KV cache, CUDA Graphs,
+and a 1,024-token prefill chunk. Each reported fixture uses five fixed seeds after server warm-up.
+Targets and weight profiles are reported independently rather than as cross-target comparisons.
+Requests were submitted serially to a persistent server. The Qwen3.8-27B NVFP4 MTP0 results use the
+same dedicated serial corpus runner as the Qwen3.6 profiles; its MTP3 results come from the C=1 point
+of the fixed concurrent-corpus campaign documented in [Performance](docs/performance.md).
 
-The API is then available at `http://127.0.0.1:8080/v1`. The Windows archive includes the required
-applications and DLLs.
+**Qwen3.6-35B-A3B**
 
-## Dual RTX 3060 12GB (2x 12GB) & 131K Context Guide & FAQ
+- MTP0 at a 7,680-token prompt: **15,544.3 prefill tok/s** and **271.1 decode tok/s**.
+- MTP0 at a 260,096-token prompt: **5,157.1 prefill tok/s** and **188.2 decode tok/s**.
+- MTP3 long reasoning: **620.3–726.2 decode tok/s** with **72.7–82.8% acceptance**.
+- MTP3 structured output: **770.9 decode tok/s**, **89.1% acceptance**, and **3.67 tokens/round**.
 
-### 1. VRAM Architecture & Tensor Split (50:50)
-On two NVIDIA GeForce RTX 3060 12GB cards (Ampere SM86, Total 24 GB VRAM), the Qwen3.8-27B model is split across both GPUs:
+**Qwen3.6-27B (`groupwise-int`)**
 
-| Component | GPU 0 (12GB) | GPU 1 (12GB) | Total (24GB) |
-|---|---:|---:|---:|
-| Model Weights (~14.8 GiB) | ~7.4 GiB | ~7.4 GiB | ~14.8 GiB |
-| KV Cache (131K INT8) | ~3.8 GiB | ~3.8 GiB | ~7.6 GiB |
-| Workspace / CUDA Graphs | ~0.5 GiB | ~0.5 GiB | ~1.0 GiB |
-| **Total Allocated VRAM** | **~11.7 GiB** | **~11.7 GiB** | **~23.4 GiB** |
+- MTP0 at a 7,680-token prompt: **3,218.1 prefill tok/s** and **77.6 decode tok/s**.
+- MTP0 at a 260,096-token prompt: **1,614.8 prefill tok/s** and **54.8 decode tok/s**.
+- MTP3 long reasoning: **161.9–175.4 decode tok/s** with **73.4–78.8% acceptance**.
+- MTP3 structured output: **193.0 decode tok/s**, **88.7% acceptance**, and **3.66 tokens/round**.
 
-### 2. Can `--max-concurrency 2` be used with `--max-context 131072`?
-**Yes, absolutely.**
-- **Paged KV Cache**: NInfer uses a shared Paged KV Cache pool. When `--kv-capacity 131072` is set, a shared physical pool of 131,072 tokens (~4.3 GiB) is allocated across the GPUs.
-- **Dynamic Sharing**: In `--max-concurrency 2` mode, two active requests can dynamically share this pool (e.g. 65K + 65K tokens, or 100K + 31K tokens). If only one request is active, it can consume the entire 131K context window.
-- **VRAM Impact**: Increasing concurrency from 1 to 2 only requires ~300–400 MB of extra memory for additional GDN state slots and batch workspaces, keeping total VRAM comfortably around ~20.7 GiB out of 24.0 GiB.
-- **TIP**: 만약 2개의 요청이 "동시에 각각 131K 토큰을 꽉 채워(총 262K)" 사용하는 극단적인 상황까지 VRAM을 최대한 확보하고 싶다면 `--kv-capacity auto`를 지정하면 남는 VRAM 전체(최대 약 170K~180K 토큰 풀)를 자동으로 KV 캐시에 할당합니다.
+**Qwen3.6-27B (`nvfp4`)**
 
-### 3. Model Download: Docker vs Pre-download
-- **Docker Images do not bundle the ~14.8 GiB model file** by design, keeping the container image small and reusable.
-- **Pre-download on Host**: Run `bash scripts/download-qwen38.sh` (or `download-qwen38.bat` on Windows) on the host machine once.
-- **Volume Mount**: Mount the downloaded folder into the container using `-v "$PWD/models:/workspace/models:ro"`.
+- MTP0 at a 7,680-token prompt: **11,191.5 prefill tok/s** and **86.4 decode tok/s**.
+- MTP0 at a 260,096-token prompt: **2,510.6 prefill tok/s** and **59.9 decode tok/s**.
+- MTP3 long reasoning: **213.1–231.0 decode tok/s** with **76.3–81.1% acceptance**.
+- MTP3 structured output: **252.2 decode tok/s**, **89.8% acceptance**, and **3.69 tokens/round**.
+- Against groupwise-int on the same corpus and runtime options: **3.48× the 7,680-token prefill
+  throughput**, **1.55× the 260,096-token prefill throughput**, and **30–32% higher MTP3 decode
+  throughput**.
 
-### 4. Direct Execution Command (Docker / Linux / Windows)
+**Qwen3.8-27B (`nvfp4`)**
+
+- MTP0 at a 7,680-token prompt: **8,340.4 prefill tok/s** and **71.2 decode tok/s**.
+- MTP0 at a 260,096-token prompt: **2,203.1 prefill tok/s** and **52.9 decode tok/s**.
+- MTP3 long reasoning: **151.4–195.2 decode tok/s** with **56.2–76.0% acceptance**.
+- MTP3 structured output: **219.8 decode tok/s**, **90.8% acceptance**, and **3.72 tokens/round**.
+
+See [Performance](docs/performance.md) for the full methodology, variability, reproduction command,
+and per-fixture results.
+
+## Evaluation
+
+Capability scores were measured through NInfer's OpenAI-compatible serving route with thinking
+enabled, MTP=3, and EvalScope 1.9.0 (0-shot, rule scoring, one sample per problem):
+
+| Model profile | AIME 2025 | AIME 2026 | GPQA-Diamond | ERQA | RealWorldQA |
+|---|---:|---:|---:|---:|---:|
+| [Qwen3.6-27B groupwise-int](model-cards/Qwen3.6-27B-NInfer/README.md) | 86.67% | 93.33% | 86.87% | — | — |
+| [Qwen3.6-27B NVFP4](model-cards/Qwen3.6-27B-nvfp4-NInfer/README.md) | 93.33% | 93.33% | 84.34% | — | — |
+| [Qwen3.6-35B-A3B groupwise-int](model-cards/Qwen3.6-35B-A3B-NInfer/README.md) | 90.00% | 90.00% | 85.35% | — | — |
+| [Qwen3.8-27B groupwise-int](model-cards/Qwen3.8-27B-NInfer/README.md) | 96.67% | 96.67% | 87.37% | 66.25% | 82.22% |
+| [Qwen3.8-27B NVFP4](model-cards/Qwen3.8-27B-nvfp4-NInfer/README.md) | 96.67% | 96.67% | 90.40% | 66.25% | 83.53% |
+
+The Qwen3.6 rows used temperature 0.6 and presence penalty 1.0; the Qwen3.8-27B rows used
+temperature 1.0 and presence penalty 0.0. The multimodal columns (ERQA and RealWorldQA) ran with
+`--vision` at a 81,920-token context limit; the text columns used a 262,144-token limit except
+Qwen3.8-27B NVFP4, which needs 252,928 to fit the RTX 5090 after weights.
+
+These are single-sample results under that NInfer evaluation profile, not pass@k. See the model
+cards and [full performance document](docs/performance.md) for correct/total counts and evaluation
+notes.
+
+## Requirements
+
+NInfer currently requires:
+
+- 64-bit Linux;
+- one NVIDIA GeForce RTX 5090 (`sm_120a`), or two for `--tp 2`;
+- NVIDIA driver support for CUDA 13.1 and the CUDA Toolkit 13.1 or newer;
+- CMake 3.28 or newer and a C++20-capable host compiler;
+- `pkg-config`;
+- FFmpeg development libraries: `libavformat >= 60`, `libavcodec >= 60`,
+  `libavutil >= 58`, and `libswscale >= 7`;
+- `libcurl >= 7.85`;
+- Ninja, when using the commands below.
+
+The build rejects CUDA architectures other than `120a`. There is no install target or packaged
+binary distribution; NInfer is run from its source build tree.
+
+## Build
+
+Clone this fork, not upstream — upstream has neither `--tp 2` nor `--rope yarn`.
 
 ```bash
-# Dual RTX 3060 12GB - 131K Context, Concurrency 2, MTP3
-ninfer-serve models/qwen3_8_27b.ninfer \
-  --host 0.0.0.0 --port 8080 \
-  --devices 0,1 \
-  --tensor-split 0.5,0.5 \
+git clone https://github.com/wamansou/ninfer-tp2-1m.git
+cd ninfer-tp2-1m
+
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build --parallel
+```
+
+The default configuration builds:
+
+```text
+build/apps/ninfer
+build/apps/ninfer-serve
+```
+
+Tests, benchmarks, and maintainer tools are excluded from the default build.
+
+## Docker
+
+Build the runtime image on a 64-bit Linux host with an RTX 5090, a CUDA 13.1-compatible NVIDIA
+driver, Docker, and the
+[NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html).
+
+```bash
+docker build --tag ninfer:local .
+```
+
+Download a model into `models/` as described below, then run the HTTP server:
+
+```bash
+docker run --rm \
+  --gpus '"device=0"' \
+  --publish 8080:8080 \
+  --volume "$PWD/models:/models:ro" \
+  ninfer:local \
+  ninfer-serve /models/qwen3_6_27b.ninfer \
+  --host 0.0.0.0
+```
+
+Run the CLI from the same image:
+
+```bash
+docker run --rm \
+  --gpus '"device=0"' \
+  --volume "$PWD/models:/models:ro" \
+  ninfer:local \
+  ninfer /models/qwen3_6_27b.ninfer \
+  --prompt "Explain prefill and decode in three sentences." \
+  --max-new 256
+```
+
+## Download a model
+
+Use the Hugging Face CLI to download one of the registered artifacts:
+
+```bash
+hf download neroued/Qwen3.6-27B-NInfer \
+  qwen3_6_27b.ninfer \
+  --local-dir models
+
+# Or the 27B NVFP4 weight variant:
+hf download neroued/Qwen3.6-27B-nvfp4-NInfer \
+  qwen3_6_27b_nvfp4.ninfer \
+  --local-dir models
+
+# Or Qwen3.8-27B:
+hf download neroued/Qwen3.8-27B-NInfer \
+  qwen3_8_27b.ninfer \
+  --local-dir models
+
+# Or Qwen3.8-27B NVFP4:
+hf download neroued/Qwen3.8-27B-nvfp4-NInfer \
+  qwen3_8_27b_nvfp4.ninfer \
+  --local-dir models
+
+# Or:
+hf download neroued/Qwen3.6-35B-A3B-NInfer \
+  qwen3_6_35b_a3b.ninfer \
+  --local-dir models
+```
+
+Current NInfer builds accept only the version-2 artifact container, and all five downloads above
+are version 2. Migration applies only to Qwen3.6 artifacts downloaded before their version-2
+publication; both Qwen3.8-27B profiles were published directly as version 2. Migrate an older exact
+local file in place:
+
+```bash
+python3 -m tools.artifact.migrate_v1_to_v2 models/qwen3_6_27b.ninfer
+```
+
+Use the same command with `qwen3_6_27b_nvfp4.ninfer` or `qwen3_6_35b_a3b.ninfer` for those
+artifacts. The migration updates only container metadata; it does not rewrite the weight payload.
+Alternatively, download the current version-2 file again from its Hugging Face repository.
+
+Each `.ninfer` file contains the weights and frontend resources needed by NInfer. It is not a
+Transformers checkpoint, Safetensors distribution, or GGUF file.
+
+Each artifact is complete, while GPU residency is fixed at process startup. Speculative decoding is
+disabled by default, so MTP/DFlash state and the optimized proposal head are not uploaded.
+Vision is also disabled by default, so its weights, Vision scratch phase, and frozen
+request-transient allocation are omitted. Add `--vision` to the CLI or server process that must
+accept image or video input. Disabled capabilities cannot be enabled by a later request. DFlash is
+available only for the 35B-A3B target and is text-only.
+
+## Run the CLI
+
+```bash
+./build/apps/ninfer models/qwen3_6_27b.ninfer \
+  --prompt "Explain prefill and decode in three sentences." \
+  --max-context 16384 \
+  --max-new 256 \
+  --spec mtp --draft-tokens 3 \
+  --lm-head-draft
+```
+
+Use `--messages FILE` instead of `--prompt` for chat history, images, or videos:
+
+```bash
+./build/apps/ninfer models/qwen3_6_27b.ninfer \
+  --messages examples/cli/messages/image_chart.json \
+  --max-context 8192 \
+  --max-new 128 \
+  --vision
+```
+
+Answer content is written to stdout. Loading progress, reasoning, timing, throughput, memory, and
+speculative-decoding statistics are written to stderr. See the [CLI guide](docs/cli.md) and
+[committed examples](examples/cli/) for structured input and runtime options.
+
+## Run the HTTP server
+
+```bash
+./build/apps/ninfer-serve models/qwen3_6_27b.ninfer \
+  --max-context 16384 \
+  --kv-capacity auto \
   --max-concurrency 2 \
-  --max-context 131072 \
-  --kv-capacity 131072 \
-  --kv-dtype int8 \
+  --spec mtp --draft-tokens 3 \
+  --lm-head-draft
+```
+
+The public model ID defaults to the artifact's `identity.model_id`; use `--model-id` only to
+publish a deployment-specific alias.
+
+Then send an OpenAI-style request:
+
+```bash
+curl http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "qwen3.6-27b",
+    "messages": [{"role": "user", "content": "Reply with one short sentence."}],
+    "max_tokens": 64
+  }'
+```
+
+The server also implements OpenAI Responses Core (typed Items, semantic SSE, local continuation
+state, and function calls) plus Anthropic Messages, token counting, and multimodal input. See
+[HTTP serving](docs/serving.md).
+
+## Dual-GPU (TP2) and YaRN 1M context
+
+`--tp 2` splits one resident model across two RTX 5090s, and `--rope yarn` raises the addressable
+context ceiling from the registered native 262,144 tokens to 1,048,576. The two features are
+independent -- TP2 halves per-card weight and KV residency at any context, YaRN extends positions
+at either `--tp` width -- but 1,048,576 tokens only fits when both are used together with INT8 KV.
+
+TP2 is a capacity feature, not a scale-out feature: one process, one resident model, two CUDA
+devices, no NVLink and no distributed serving. It is implemented for the 27B execution package
+(`qwen3.6-27b` and `qwen3.8-27b`, either weight profile); `qwen3.6-35b-a3b` has no tensor-parallel
+path and rejects `--tp 2` at startup. Every measurement below was taken on the Qwen3.8-27B NVFP4
+artifact.
+
+### Usage
+
+```bash
+# 1,048,576-token context, both GPUs, INT8 KV, MTP3 speculative decoding
+./build/apps/ninfer-serve models/qwen3_8_27b_nvfp4.ninfer \
+  --tp 2 --devices 0,1 \
+  --rope yarn --yarn-factor 4.0 --yarn-origin 262144 \
+  --max-context 1048576 --kv-dtype int8 --kv-capacity auto \
+  --max-concurrency 1 \
   --spec mtp --draft-tokens 3 --lm-head-draft
 ```
 
----
+The same flags drive the CLI; add `--no-thinking` when a short `--max-new` budget must reach the
+answer channel, because at this checkpoint's default thinking mode a 16-token budget is consumed
+entirely inside the reasoning stream:
 
-## Qwen3.8-27B support and RTX 3090 results
+```bash
+./build/apps/ninfer models/qwen3_8_27b_nvfp4.ninfer \
+  --tp 2 --devices 0,1 \
+  --rope yarn --yarn-factor 4.0 --yarn-origin 262144 \
+  --max-context 1048576 --kv-dtype int8 --kv-capacity auto \
+  --messages long_prompt.json --max-new 256 --no-thinking
+```
 
-Qwen3.8-27B is validated from one through eight simultaneous users. ReplaySSM cuts the memory cost
-of speculative decoding, allowing the faster MTP3 mode to remain enabled at C8. The table below is
-the new sustained test: every request generated 1,024 tokens with CUDA Graphs enabled.
+- `--tp 2` requires an explicit `--devices A,B` naming two distinct devices of the same compute
+  capability. `--tp 1` remains the default and is unchanged: `scripts/tp1-regression.sh` compares
+  this build's greedy output against token streams recorded from upstream `ninfer` at base commit
+  `feaf4dd`, over a short chat, a 2,191-token instruction and a 28,677-token document, and requires
+  the token ids, the generated text and the deterministic summary rows to be byte-equal. Its scope
+  is exactly that: greedy text decode, `--tp 1`, `--rope native`, NVFP4 weights, `qwen3.8-27b`, MTP
+  off, concurrency 1. See `tests/data/tp1-golden/MANIFEST.md`.
+- `--rope yarn` needs `--yarn-origin` to equal the artifact's registered native capacity
+  (`262144`); `--yarn-factor` is a finite value in `[1.0, 64.0]` and `origin x factor` must be a
+  whole token count at or below `1048576`.
+- `--kv-dtype int8` is mandatory at 1M: BF16 KV needs four times the pool and does not fit.
+- `--max-concurrency 1` is arithmetic, not policy, at 1M -- one sequence costs 16.66 GiB per device
+  without MTP and 17.69 GiB with it, so a second slot cannot fit on a 32 GiB card.
+- MTP speculative decoding (`--spec mtp --draft-tokens 1..5`, optionally `--lm-head-draft`) works
+  at `--tp 2` including at 1M. `--spec dflash` and `--vision` are rejected at `--tp 2`.
 
-The prompts were **29-34 input tokens** and the server's maximum context window was **8,192 tokens
-per request**. Each measured sequence therefore reached roughly 1,053-1,058 tokens including its
-generated output. This is a long-output/decode benchmark, not an 8K-prompt or long-prefill test.
-C1-C4 used an 8,192-token shared KV pool; C8 used 16,384 tokens so all eight requested outputs
-could be admitted simultaneously.
+See the [CLI guide](docs/cli.md) and [HTTP serving](docs/serving.md) for the full option contract.
 
-| Cohort | Total output | End-to-end throughput | Decode throughput | MTP acceptance | Mean TTFT | Peak VRAM |
-|---:|---:|---:|---:|---:|---:|---:|
-| C1 | 1,024 tokens | **70.19 tok/s** | **71.00 tok/s** | 61.13% | 149 ms | 19,641 MiB |
-| C2 | 2,048 tokens | **89.43 tok/s** | **90.66 tok/s** | 59.66% | 262 ms | 20,022 MiB |
-| C4 | 4,096 tokens | **97.89 tok/s** | **100.28 tok/s** | 59.63% | 538 ms | 20,641 MiB |
-| C8 | 8,192 tokens | **161.28 tok/s** | **165.33 tok/s** | 56.84% | 1,215 ms | 22,138 MiB |
+### Memory, per GPU
 
-C1 is the responsive choice for a single user. C8 delivers **2.3x the total throughput** when
-several requests are active. The C8 long-output test uses a 16K shared KV pool so all eight
-1,024-token responses can be admitted together.
+Qwen3.8-27B NVFP4, `--tp 2 --devices 0,1 --kv-dtype int8 --kv-capacity auto`, one active request.
+`Resident` is `nvidia-smi` per-process memory, which was flat across every sample of every run --
+a 1M-token prefill does not push residency above the value chosen at load.
 
-### Prompt-processing speed
+| Context | MTP | Weights | Sequence (KV + GDN state) | Workspace | Reserved (load summary) | Resident (`nvidia-smi`) |
+|---:|---|---:|---:|---:|---:|---:|
+| 262,144 | off | 10.08 GiB | 4.28 GiB | 0.18 GiB | — | **15.04 GiB** |
+| 262,144 | MTP3 | 10.46 GiB | 4.54 GiB | 0.19 GiB | — | **15.69 GiB** |
+| 1,048,576 | off | 10.08 GiB | 16.66 GiB | 182.81 MiB | 26.93 GiB | **27.41 GiB** |
+| 1,048,576 | MTP3 | 10.46 GiB | 17.69 GiB | 192.93 MiB | 28.42 GiB | **28.84 GiB** |
 
-Prompt processing was tested separately with **4,362 fresh input tokens per request**, an 8,192-token
-per-request context window, 512-token prefill chunks, INT8 KV, ReplaySSM/MTP3, CUDA Graphs, and
-prefix reuse disabled. Each request generated only 16 tokens so the run measures prefill rather
-than long decode.
+The KV pool is 16.5 KiB per token per device at INT8 group-64, quantization-scale planes included,
+which is the 16.50 GiB pool at 1,048,576 tokens.
+Turning MTP3 on costs a **measured 1.49 GiB of reserved memory per device at 1M and 0.65 GiB at
+262k** -- it is not a constant. Its two dominant terms are **0.38 GiB of head weights**, fixed at
+any window, and **1.03 GiB of MTP KV per 1M tokens of window**; the remainder of each measured
+delta is workspace and sequence-arena rounding. The KV term is one full extra attention layer's
+worth of KV over the window -- one sixteenth of the text pool -- which is what a one-layer MTP head
+costs. The 262,144-token rows were measured through `ninfer-serve`'s startup record and
+`nvidia-smi`, which is why they carry no CLI load-summary `reserved` row.
 
-| Cohort | Total fresh input | Aggregate prefill | Active-prefill speed | Mean TTFT | Peak VRAM |
-|---:|---:|---:|---:|---:|---:|
-| C1 | 4,362 tokens | **861.51 tok/s** | 893.98 tok/s | 4,893 ms | 19,114 MiB |
-| C2 | 8,724 tokens | **853.86 tok/s** | 883.95 tok/s | 7,478 ms | 19,697 MiB |
-| C4 | 17,448 tokens | **847.26 tok/s** | 874.49 tok/s | 12,692 ms | 20,894 MiB |
-| C8 | 34,896 tokens | **844.10 tok/s** | 870.94 tok/s | 23,028 ms | 23,207 MiB |
+At 1M with MTP3 the headroom to a 30 GiB per-device budget is **1.16 GiB**, the tightest shipped
+configuration. For comparison, the same artifact at `--tp 1` needs 27.9 GiB on one card for a
+252,928-token window with MTP off and 29.16 GiB with MTP3, and cannot reach 262,144 at all.
 
-`Aggregate prefill` is total fresh input tokens divided by the complete request-wave time, so it is
-the user-facing throughput number. NInfer currently processes one long prefill at a time; cohort
-batching accelerates decode, but does not multiply prompt ingestion. Consequently C1-C8 remain near
-844-862 input tok/s while queued requests increase mean TTFT. `Active-prefill speed` excludes queue
-waiting and measures only the server's recorded prefill phase.
+### Measured performance
 
-### RotorQuant KV (`rk8v4`) — currently unavailable
+**Every figure carries a per-GPU power limit.** The campaign was measured at a **400 W** cap (the
+minimum settable limit on these cards); the publishable set was then re-measured with both cards at
+**575 W** (vendor defaults are 600 W and 575 W; maximum 600 W). Do not quote any figure below
+without its power condition.
 
-`rk8v4` was an experimental, opt-in KV-cache mode for Qwen3.8-27B that applied a normalized
-transform to queries and keys, rotated values before four-bit storage, and reversed the value
-transform after attention.
+Single request, INT8 KV, CUDA Graphs on, greedy decoding, byte-identical prompt on both widths:
 
-It is **not available in this build**. Upstream now owns KV quantization in a dedicated
-`kv_cache_append` Op, whose published numerical contract rotates K with a normalized H256
-transform and stores V from unrotated BF16 source values. rk8v4's H64 rotation and int4-V
-representation have no implementation against that contract yet, so `--kv-dtype rk8v4` parses but
-is rejected during engine construction rather than silently degrading to INT8.
+| Workload | TP1 @400 W | TP2 @400 W | TP1 @575 W | TP2 @575 W |
+|---|---:|---:|---:|---:|
+| 249,955-token prompt, MTP off — prefill | 2,269.8 | **2,680.1** | 2,484.2 | **2,787.0 tok/s** |
+| 249,955-token prompt, MTP off — decode | 52.35 | **75.18** | 53.95 | **75.32 tok/s** (1.40x) |
+| 249,955-token prompt, MTP3 — decode | 101.7 | **152.1** | 113.60 | **159.39 tok/s** |
+| 249,955-token prompt, MTP3 — draft acceptance | 50.83% | **57.96%** | 50.83% | **57.96%** |
+| 249,955-token prompt — time to first token | 111.0 s | **93.7 s** | 101.0 s | **90.0 s** |
+| 536-token reasoning prompt, MTP3 — decode | 152.0 | **189.5** | — | — |
+| 652,955-token prompt, MTP off — prefill / decode | does not fit | **1,348.4 / 58.22** | does not fit | not re-measured |
+| 1,045,954-token prompt, MTP off — prefill / decode | does not fit | **928.9 / 46.39** | does not fit | **975.1 / 48.08** |
+| 1,045,954-token prompt, MTP3 — decode (512 tokens) | does not fit | — | does not fit | **100.54 tok/s** at 56.41% |
 
-Porting RotorQuant onto the new Op is tracked as follow-up work. Until then the previously
-published 226,560-token and 247,872-token RotorQuant context measurements do not describe this
-build. Use `--kv-dtype int8`, which reaches 171,648 tokens at the 1 GiB headroom boundary.
+Lifting the cap helps TP1 more than TP2, and the reason is visible in sampled draw: one card running
+the whole model saturates its limit (peak 575.5 W), while two cards sharing it peak at 391 and
+406 W. The TP2-over-TP1 decode advantage therefore narrows from **1.44x at 400 W to 1.40x at
+575 W** -- TP2 is still faster, and it gets there inside a much smaller power envelope.
 
-### Qwen3.8 vision
+At 575 W the 1,045,954-token prefill takes **17.9 minutes** per request, against 18.8 at the 400 W
+cap. Decode degrades smoothly with context rather than falling off a cliff: at the 400 W cap,
+97.9 tok/s at 8k, 58.2 at 653k and 46.4 at 1,046k; the 1,046k point rises to 48.1 at 575 W. Only
+the 250k and 1,046k tiers were re-measured at 575 W. At long context TP2 is *faster* than TP1, not
+merely larger, because per-card weight and KV traffic halve while the cross-device collectives cost
+about 0.2 ms per token under CUDA Graphs.
 
-The same Qwen3.8 artifact supports images. Start the server with `--vision`, MTP3, INT8 KV, and a
-32K maximum context. The Windows archive includes `run-qwen38-vision.bat` for this profile.
+Saturated concurrent decode at a 262,144-token window, `--tp 2`, aggregate committed tok/s:
 
-A 1,920×1,080 image expanded to 2,074 prompt tokens and was read correctly. Measured TTFT was
-3.29 seconds, decode reached 98.1 tok/s, MTP acceptance was 96.7%, and startup retained 2.16 GiB
-free VRAM. The artifact also declares multi-image and video support; this release test directly
-validated a single image.
+| Concurrency | MTP off @400 W | MTP3 @400 W | MTP off @575 W | MTP3 @575 W |
+|---:|---:|---:|---:|---:|
+| 1 | 93.5 | 172.4 | 94.1 | 177.8 |
+| 2 | 183.0 | 287.0 | — | — |
+| 4 | **314.3** (3.36x) | **466.0** (2.70x) | **320.3** (3.40x) | **475.2** (2.67x) |
 
-## Qwen3.6-35B-A3B RTX 3090 results
+Per-GPU residency stayed at or below 15.64 GiB at C=4.
 
-Measured with the compact 20.84 GiB 35B-A3B artifact, a 4K shared INT8 group-64 paged KV pool,
-CUDA Graphs, MTP3, greedy decoding, and no competing GPU workload:
+### Compared with vLLM
 
-| Concurrent requests | 128 output tokens each | Observed VRAM |
-|---:|---:|---:|
-| 1 | 162.7 aggregate tok/s | 22,427 MiB |
-| 2 | 267.9 aggregate tok/s | 22,743 MiB |
-| 4 | 366.2 aggregate tok/s | 23,377 MiB |
-| 6 | 383.4 aggregate tok/s | 24,038 MiB |
-| 8 | rejected at startup | about 503 MiB over the safe reservation limit |
+On byte-identical 250k / 653k / 700k-token prompts with **both cards capped at 500 W** -- a third
+power condition, not comparable with the 400 W and 575 W rows above -- vLLM 0.25.1 (TP2, FP8 KV,
+YaRN through `--hf-overrides`, MTP3) prefills **1.17-1.32x faster**, while NInfer decodes **1.41x
+faster at 250k and 2.5-2.8x faster at 653k and 700k**, because vLLM's MTP acceptance is exactly
+**0%** past its native 262,144-token window where NInfer's stays at 51-60%. NInfer also holds a
+**38% larger window in less memory**: 1,048,576 tokens at 27.41 GiB per GPU against vLLM's 759,297
+at 28.90 GiB. At a 512-token answer the request is almost all prefill, so vLLM finishes first at
+every tier; NInfer wins beyond roughly 4,800 / 7,600 / 8,800 output tokens. The two engines ran
+different NVFP4 quantizations of different fine-tunes and different KV dtypes, and no quality claim
+is made -- the full table, method and caveats are in
+[Performance](docs/performance.md#cross-engine-comparison-against-vllm-nvfp4-500-w-per-gpu).
 
-A longer 512-token-per-request check reached **286.8 tok/s at C1** and **399.1 aggregate tok/s at
-C2**. These short-prompt measurements include request-level timing and are not directly comparable
-to v0.3.1's 1,500-token adaptive prompt-lookup benchmark.
+### Retrieval
 
-Compatible-prefix reuse was validated end to end: a repeated 26-token prompt reused 24 tokens,
-reducing measured prefill from 371 ms to 10 ms.
+Needle-in-a-haystack, five depths (10/30/50/70/90%) x two independent haystacks, rule-scored exact
+match, thinking disabled, greedy:
 
-### Qwen3.6-35B vision
+| Engine and configuration | Haystack | Prompt tokens | Retrieved |
+|---|---|---:|:-:|
+| NInfer TP2, native rope | 262k, **tiled** corpus | 259,954 | **10 / 10** |
+| NInfer TP2 + YaRN x4 | 653k, distinct text | 652,954-652,955 | **10 / 10** |
+| NInfer TP2 + YaRN x4 | **1,046k, distinct text** | 1,045,954-1,045,955 | **10 / 10** |
+| vLLM control (model ceiling) | 653k, distinct text | 652,954-652,955 | **10 / 10** |
 
-The compact 35B artifact includes its vision encoder and accepts images through the same OpenAI-
-compatible API. Start the server with `--vision` and leave speculative decoding disabled. The
-Windows archive includes `run-qwen36-35b-vision.bat` for this profile.
+Three qualifications travel with that table:
 
-The safe RTX 3090 profile is **one request, 32K maximum context, INT8 KV, vision enabled, and MTP
-disabled**. A current v0.6 test processed three 1,920×1,080 images correctly. Each image expanded
-to a 2,081-token prompt; engine TTFT was 3.76–4.07 seconds, decode was about 159 tok/s, and peak
-VRAM was 23,944 MiB. This leaves little room for another GPU workload.
+- **The 262k row uses a tiled haystack.** The stock corpus is 2.7 MB (644 KB of English essays plus
+  a Chinese novel), so any English tier past roughly 150k tokens repeats the corpus -- at 262k each
+  window occurs about twice. Retrieval stays valid because the needle is unique, but it is an
+  easier task than the 653k and 1,046k rows, whose haystacks are purpose-built distinct text with
+  200 of 200 sampled windows occurring exactly once.
+- **The vLLM control is a different checkpoint** (`orcarouter/Qwen3.8-27B-Uncensored-FP8`, FP8
+  weights, FP8 KV, speculation on) against NInfer's NVFP4 conversion of a different fine-tune. The
+  two rows share a model family and a YaRN configuration, not weights. The row establishes the
+  model-side retrieval ceiling under this YaRN configuration; it is not an engine-versus-engine
+  comparison.
+- **10/10 is not a demonstration of a high per-depth rate.** The 1M grid ran two samples per depth;
+  for 10 successes in 10 trials the exact one-sided 95% Clopper-Pearson lower bound is 74%.
+- **A needle just past 262k does not by itself prove YaRN works.** With the YaRN descriptors
+  nulled, a 270k needle still resolved -- the model tolerates roughly 10% extrapolation past its
+  trained ceiling unaided. The >262k legs of the real-weights YaRN test therefore establish
+  *position addressability*, not YaRN quality. The 653k and 1,046k retrieval rows are what
+  demonstrate YaRN's value, being at genuine multiples of the native window.
 
-MTP is intentionally off for this profile. At 32K, speculative recurrent state would exceed the
-3090 memory budget; KV compression alone does not recover enough memory. Text-only 35B profiles can
-still use MTP3 as documented above.
+Retrieval, not recall: with an invented needle -- an invented place and an invented activity that
+cannot be in any training set -- substituted at depth 50 of a 1,045,956-token prompt, the model
+reproduced the sentence verbatim.
+
+### Soak
+
+All timings in this subsection were taken at the 400 W per-GPU cap (see
+[Measured performance](#measured-performance) above); the soak was not re-run at 575 W.
+
+Two consecutive passes decoded from a 949,885-token prompt to the exact 1,048,576-token ceiling:
+98,692 generated tokens each, `finish reason context-capacity`, 52 minutes of wall clock per pass,
+prefill 1,011.89 and 1,009.97 tok/s, decode 45.49 and 45.39 tok/s, per-device residency flat at
+28,070 MiB (span 4 MiB), and the two passes' 98,692-token id streams and 380,672-byte reply texts
+hash identically. No OOM, no NaN: ten logit-sanity windows sampled every 10k tokens kept top-1
+share at 6.43-6.60% with no out-of-domain ids.
+
+Greedy decoding degenerates on this prompt at this context length, by two distinct mechanisms, and
+the soak stream is therefore stability and determinism evidence rather than a sample of 1M-context
+generation quality. Without a speculative backend and with `--ignore-eos`, the model finishes an
+answer turn, the suppressed end-of-turn token lets it answer again, and it settles into a
+1,903-token turn cycle repeated 46 times byte for byte. With MTP3 the ~950k greedy stream contains
+no end-of-turn token at all and still collapses, into a 187-token content-level loop whose first
+repeat begins at generated index **1,201** -- that one is plain greedy degeneration, not an
+`--ignore-eos` artifact. Sampled decoding at temperature 0.8 does not loop.
+
+### YaRN reference and drift guard
+
+NInfer's YaRN frequency correction is computed to match vLLM as deployed, including vLLM's
+multimodal rotary path: correction range `(16, 24)` and an `mscale` of 1.13863 applied to `cos`/`sin`
+over the 64 rotary dimensions of each 256-dimension head. The reference values are checked in at
+`tests/core/data/yarn_ref_4x.json` (recorded against vLLM 0.25.1), and
+`ninfer_qwen3_6_yarn_rope_drift_test` regenerates them from the installed vLLM and fails if either
+the numbers or the vLLM version drift. Without a vLLM environment the test skips. To regenerate the
+reference after a deliberate vLLM upgrade:
+
+```bash
+VLLM_LOGGING_LEVEL=WARNING "$NINFER_VLLM_PYTHON" tools/tp2/dump_yarn_ref.py \
+  > tests/core/data/yarn_ref_4x.json
+ctest --test-dir build -R ninfer_qwen3_6_yarn_rope_drift_test --output-on-failure
+```
+
+`NINFER_VLLM_PYTHON` points at the Python interpreter of the vLLM environment; the test falls back
+to a known local path when the variable is unset, and `NINFER_YARN_REF_JSON` overrides the compared
+file.
+
+### Test environment variables
+
+The dual-GPU and YaRN tests are opt-in the same way the rest of the artifact-gated suite is: each
+reads an environment variable, falls back to a local default path, and skips (rather than fails)
+when the resource is not present.
+
+| Variable | Used by | Default |
+|---|---|---|
+| `NINFER_QWEN3_8_27B_NVFP4_WEIGHTS` | the sharded-materialization and TP2 real-Engine CTest routes | `/home/pc/models/ninfer-38/huihui-nvfp4/qwen3_8_27b_nvfp4.ninfer` |
+| `NINFER_VLLM_PYTHON` | `ninfer_qwen3_6_yarn_rope_drift_test`, and `tools/tp2/dump_yarn_ref.py` above | `/home/pc/Projects/vllm/unsloth-nvfp4-env/bin/python` |
+| `NINFER_YARN_REF_JSON` | `ninfer_qwen3_6_yarn_rope_drift_test`, to compare against a scratch reference instead of the committed one | `tests/core/data/yarn_ref_4x.json` |
+
+`scripts/tp1-regression.sh` takes the artifact as its first positional argument instead, and
+`TP1_GPU` selects the physical GPU it runs on.
+
+### Limitations
+
+- **Vision is `--tp 1` only.** The Vision encoder runs on the primary device against replicated
+  weights and has no split path, so `--tp 2 --vision` is rejected at startup. YaRN is likewise
+  rejected together with `--vision`, because the encoder ropes 2-D image-grid positions.
+- **DFlash is unchanged and is rejected at `--tp 2`.** It remains a 35B-A3B text-only backend, and
+  that target has no tensor-parallel path at all.
+- **No NVLink, and no peer-to-peer on GeForce.** `cudaDeviceCanAccessPeer` reports 0 between two
+  RTX 5090s, so the collectives are host-staged asynchronous copies over PCIe rather than direct
+  peer copies. This is a measured property of the hardware, not a configuration choice. A decode
+  token costs 128 reduces plus one logit all-gather; a 10 KiB reduce measures about 16 us, and
+  under CUDA Graphs the whole collective set costs roughly 0.2 ms per token (both at the 400 W
+  per-GPU cap).
+- **MTP prefix reuse resets at `--tp 2`.** Resuming a prefix drives the MTP head from a retained
+  target hidden state that only the primary device holds, so `--tp 2 --spec mtp` downgrades every
+  reuse to a full prefill. The answer is unchanged and no request fails; the saving is lost, which
+  matters for multi-turn conversation at long context.
+- **MTP is output-equivalent up to near-tie argmax flips, not bit-identical.** A verify round
+  evaluates the target model over `K+1` columns at once and an ordinary round over one, which
+  selects different GEMM shapes; greedy MTP-on and MTP-off streams can therefore diverge on a
+  near-tie token. Every committed token is still one the target model's own argmax selected. On the
+  1,046k needles the MTP3 and MTP-off answers are identical token for token; on a 949,885-token
+  soak stream they first differ at generated index 45. Measured like for like at 575 W -- same
+  1,045,954-token prompt, same 512-token budget -- MTP3 decodes **2.18x** faster than MTP off.
+- **1,048,576 tokens is a one-slot configuration.** `--max-concurrency` must be 1; concurrency at
+  extended context requires coming down from the ceiling (roughly 500k for two slots at INT8 KV).
+- **`--ignore-eos` is a diagnostic flag.** It exists for fixed-length soak and throughput work.
+  Generation past the end-of-turn token is off-distribution and is not a product output. It is not
+  the only route to a degenerate stream: greedy decoding at this context length also loops on its
+  own content, with the flag off.
+- **A full-ceiling prefill costs about 18 minutes** (17.9 at 575 W, 18.8 at the 400 W cap), and 1M
+  decode runs at roughly 48 tok/s, or 100 tok/s with MTP3. Retrieval is not the binding constraint
+  at 1M; latency is.
+- The decode split policy was tuned at 262k. At 1M it is smooth rather than pathological, but it
+  has not been swept at that length.
+- **A 1M boot can fail on the CUDA Graph allowance, transiently.** One 1,048,576-token
+  `--tp 2` boot aborted at startup with `CUDA Graph preparation consumed 44433408 bytes on device
+  0, exceeding the planned per-device allowance of 20971520 bytes`. The identical command line had
+  booted minutes earlier and booted again on the immediate retry, and successful boots of that same
+  configuration report only 2.00-3.44 MiB of captured graph memory per device, so the 20 MiB
+  per-device allowance is too tight against a capture pool that is not deterministic. The
+  workaround is to retry; the fix is to raise the allowance or size it from a measured reservation.
+  The failing log is kept at
+  `eval/results/cross-engine-nvfp4/ninfer-500w-700000-mtp0-cudagraph-allowance-failure.txt`.
+- **Three power conditions, and every number carries one.** The campaign ran at a **400 W** per-GPU
+  cap, the publishable subset was re-measured at **575 W**, and the cross-engine comparison against
+  vLLM was taken at **500 W**. Never quote a figure without its condition, and never compare figures
+  across conditions.
+- **What is not measured.** Concurrency C=2 was measured only at the 400 W cap, and the 653k tier
+  was not re-measured at 575 W. The soak is greedy only; a seeded temperature > 0 soak has not been
+  run. The cross-engine comparison has no vLLM MTP-off row -- speculative decoding is fixed at
+  vLLM's launch and that restart was not made -- and the prefill-chunk difference behind vLLM's
+  prefill lead (`--prefill-chunk 1024` against `--max-num-batched-tokens 16768`) was not swept on
+  either engine. Independent FP64-oracle conformance for shard extents covers the FP8 A8 row
+  extents only -- the NVFP4, Q4, Q5, W8 and vocabulary shard geometries are qualified pairwise
+  against the `--tp 1` kernel on the whole weight, plus the model-level parity, retrieval and
+  MTP-argmax evidence.
+
+This section and [Performance](docs/performance.md) carry the headline figures with their
+reproduction commands. The design decisions behind them -- the collective transport, the shard map,
+the YaRN constants, and what each correctness gate actually proves -- are in
+[Dual-GPU (TP2) execution and YaRN 1M context](docs/maintainer/tp2-yarn-1m.md).
 
 ## Capabilities
 
-- Native SM86 CLI and server applications for Linux and Windows.
-- A prebuilt Windows archive with tested launchers.
-- OpenAI Chat Completions, Responses, and Anthropic-compatible APIs.
-- ReplaySSM and MTP3 for higher throughput without exceeding 24 GB VRAM.
-- `low`, `medium`, and `xhigh` reasoning modes.
-- Qwen3.8 image understanding with ReplaySSM and MTP3.
-- Prefix reuse for faster repeated or shared prompts.
-- Qwen3.6-35B image understanding with a guarded 32K profile.
-- Windows one-user and eight-user launchers with safe tested defaults.
+All three registered model IDs support:
 
-## Supported artifacts
-
-| Model | Artifact | Size | Notes |
-|---|---|---:|---|
-| Qwen3.6-35B-A3B v1 | [pinned compact artifact](https://huggingface.co/neroued/Qwen3.6-35B-A3B-NInfer/tree/c8b8c1c0df4c74df3c190c6aa3a7f24dc614721c) | 20.84 GiB | **Recommended for RTX 3090; text C1-C6 at 4K and vision C1 at 32K** |
-| Qwen3.6-35B-A3B v2 | [current upstream artifact](https://huggingface.co/neroued/Qwen3.6-35B-A3B-NInfer) | 21.22 GiB | Reader supported by v0.5+; includes DFlash payload and is not the measured 3090 artifact |
-| Qwen3.6-27B | [groupwise artifact](https://huggingface.co/neroued/Qwen3.6-27B-NInfer) | 16.29 GiB | Supported with more runtime headroom |
-| **Qwen3.8-27B** | [official NInfer groupwise artifact](https://huggingface.co/neroued/Qwen3.8-27B-NInfer) | 16.96 GiB | **Validated at C1, C2, C4 and C8/MTP3 with ReplaySSM** |
-
-NInfer-3090 v0.5 and newer recognize both v1 and v2 container magic. The current 21.22 GiB v2
-artifact contains additional DFlash weights and is not the artifact used for the published RTX
-3090 concurrency results. The pinned compact v1 artifact keeps the measured model payload and
-omits DFlash, providing the known 24 GB memory profile.
-
-## Models and platform support
-
-Linux users build the applications from source or use the Docker image. Windows users can use the
-prebuilt archive, which includes the applications and required DLLs. Both platforms require an
-RTX 3090 or RTX 3090 Ti and a recent NVIDIA driver.
-
-Download the [official Qwen3.8 artifact](https://huggingface.co/neroued/Qwen3.8-27B-NInfer) as
-`models/qwen3_8_27b.ninfer`. Windows users can run `download-qwen38.bat` instead.
-
-For Qwen3.6-35B-A3B, the smaller
-[pinned container-v1 artifact](https://huggingface.co/neroued/Qwen3.6-35B-A3B-NInfer/tree/c8b8c1c0df4c74df3c190c6aa3a7f24dc614721c)
-is recommended on a 24 GB card. Releases v0.5 and newer also read the larger container-v2 file.
-An `artifact magic is not NInfer version 1` message means the executable is outdated, not that the
-current model download is necessarily corrupt.
-
-Developers can build from source on Windows or Linux. Windows uses Visual Studio 2022 and vcpkg.
-Linux uses GCC 13 with system packages or the pinned vcpkg manifest. Both builds require CUDA 12.8
-or newer and CMake 3.28 or newer.
-
-See the [Windows build guide](docs/rtx-3090-windows.md) or the
-[Linux build guide](docs/rtx-3090-linux.md). Ordinary Windows release users do not need these tools.
-
-## Qwen3.8 reasoning effort
-
-Qwen3.8-27B supports distinct reasoning-effort modes. `medium` uses the model's normal thinking
-prompt. `xhigh` injects the checkpoint's extended deliberation instruction, asking it to validate
-assumptions and consider alternatives. This is a real prompt-template change, not a sampling alias.
-
-| Value | Qwen3.8 behavior |
-|---|---|
-| `none` | Disable thinking |
-| `low` | Keep reasoning brief and focused |
-| `medium` | Use normal Qwen3.8 thinking |
-| `xhigh` | Use extended deliberation and verification |
-
-OpenAI Chat Completions accepts a top-level `reasoning_effort` field:
-
-```json
-{
-  "model": "qwen3.8-27b",
-  "messages": [{"role": "user", "content": "Solve this carefully..."}],
-  "reasoning_effort": "xhigh",
-  "max_tokens": 4096
-}
-```
-
-OpenAI Responses uses `"reasoning": {"effort": "xhigh"}`. Anthropic Messages uses
-`"output_config": {"effort": "xhigh"}`. For the native CLI, pass
-`--reasoning-effort low|medium|xhigh`; use `--no-thinking` instead of an effort to disable
-reasoning. Chat Completions returns hidden reasoning separately as `message.reasoning_content`.
-
-## Serving APIs
-
-The server supports:
-
-- OpenAI Chat Completions;
-- OpenAI Responses Core with streaming and local continuation state;
-- Anthropic Messages;
+- text generation with thinking and non-thinking prompt modes;
+- image, multi-image, video, and mixed multimodal messages;
+- chunked prefill and CUDA Graph decode;
+- startup-bounded small-scale concurrent serving with true batched decode;
+- MTP speculative decoding with draft windows from one to five;
+- BF16 and INT8 group-64 KV cache;
+- model- and thinking-mode-aware official sampling defaults, with explicit greedy, temperature,
+  top-k, top-p, min-p, and presence/frequency-penalty overrides;
 - compatible-prefix reuse;
-- prompt-rendered function tools and parsed tool calls;
-- bounded pending-request admission and JSONL request logs.
+- OpenAI Responses Core, OpenAI Chat Completions, and Anthropic Messages, including streaming and
+  usage accounting;
+- prompt-rendered function tools and parsed tool calls.
 
-See [HTTP serving](docs/serving.md) and [CLI usage](docs/cli.md).
-
-## How cohort batching works
-
-The C number is the maximum number of requests NInfer can run together. C1 favors one interactive
-user; C8 can combine up to eight active requests into each GPU step for much higher total output.
-
-Follow-up requests do not need to arrive at the same instant. When a running request finishes, the
-next waiting request can join at a safe generation boundary. Empty or finished lanes are skipped,
-so a C8 server also works normally with only one, two, or four active users.
-
-This is deliberately more bounded than datacenter-style dynamic batching. The maximum number of
-users and GPU memory are chosen when the server starts. In return, memory use stays predictable on
-a 24 GB card and the server can reuse fast CUDA Graphs instead of rebuilding work continuously.
+The 35B-A3B target additionally supports text-only DFlash speculative decoding with draft windows
+from one to fifteen.
 
 ## Current limits
 
-- One process owns one model on one RTX 3090.
-- Concurrency is fixed at startup and limited to 1-8 by the API; compact 35B fits C1-C6 and
-  Qwen3.8-27B fits C8/8K with MTP3 through ReplaySSM.
-- The shared KV pool is fixed at startup and is not divided statically among request lanes.
-- This is bounded small-scale batching, not preemptive large-scale continuous batching.
-- No multi-GPU execution or CPU/GPU weight offload.
-- Tool calls are returned to the client but are not executed by NInfer.
-- NVFP4 A4, FP8 A8, and TMA kernels require Blackwell and are unavailable on SM86. FP8 and NVFP4
-  weights are admitted through their A16 dequantizing routes.
-- The paged runtime exposes BF16 and INT8 group-64 KV; INT8 remains the quality-default path.
-  Upstream's row-scaled FP8 E4M3 KV profile and `rk8v4` both parse but are rejected on SM86.
+- Only the five `(model_id, weights_id)` artifact identities listed above are accepted product
+  identities.
+- Execution is specialized for the RTX 5090. One CUDA device is the default; the 27B execution
+  package also runs on exactly two with `--tp 2 --devices A,B`, which is a capacity feature rather
+  than scale-out.
+- One Engine owns one resident model and supports a startup-fixed capacity of 1–8 active requests.
+  Decode-ready requests are compacted at round boundaries and executed in one batched model
+  traversal.
+- NInfer does not provide large-scale or preemptive continuous batching, priority/QoS scheduling,
+  CPU/GPU offload, or distributed serving. Multi-GPU execution is exactly the two-device
+  tensor-parallel width described above: one process, one resident model, no NVLink, no more than
+  two devices.
+- `--max-context` is the logical ceiling of each sequence and is configurable up to the registered
+  models' native 262,144-token limit, or up to 1,048,576 tokens under `--rope yarn` on the 27B
+  targets. `--kv-capacity N` explicitly sizes the shared Main Text KV
+  pool for all active and retained sequences, while `--kv-capacity auto` selects the largest usable
+  capacity from the memory remaining after weights are loaded while preserving 1 GiB of sizing
+  headroom. Omission defaults to one `--max-context` worth of pages. The resolved pool is fixed at
+  startup and is not divided statically among request lanes.
+- Tool calls are parsed and returned to the client; NInfer does not execute tools.
+- The C++ headers are used by the in-tree applications and are not distributed as an installed SDK.
 
-## Validation
+## Documentation
 
-The v0.6.0 Windows gate covered Qwen3.8 generation, materialization, request memory, admission,
-paged KV, prefix reuse, speculative rounds, and SM86 W8 Linear paths.
-
-The v0.6.1 Linux source gate completed all 245 Docker compile and link steps with CUDA 13.1 on
-Ubuntu 24.04. Both Linux applications returned their `--help` output with GPU access enabled.
-A real-artifact Linux generation and Linux performance qualification remain open.
-
-## Upstream
-
-NInfer-3090 is derived from [Neroued/ninfer](https://github.com/Neroued/ninfer). The upstream project
-targets RTX 5090/`sm_120a`; this fork carries the Windows and Linux SM86 compatibility layer,
-compact 35B artifact support, and RTX 3090-specific schedules and memory planning.
-
-## Contributors
-
-See [CONTRIBUTORS.md](CONTRIBUTORS.md) for the complete, maintained credit list.
-
-- [airtonix](https://github.com/airtonix) added Linux and Docker build and release support in
-  [PR #1](https://github.com/Don-Chad/ninfer-3090/pull/1).
-- [ColeWheatley](https://github.com/ColeWheatley) contributed SM86 runtime-count/GDN residency
-  fixes, ECC diagnostics, and the GeForce-safe Docker fix in
-  [PR #7](https://github.com/Don-Chad/ninfer-3090/pull/7).
-- [justinlime](https://github.com/justinlime) added NixOS build support in
-  [PR #5](https://github.com/Don-Chad/ninfer-3090/pull/5).
-- [sry9681](https://github.com/sry9681) contributed the device-wide GPU-memory startup fix in
-  [PR #6](https://github.com/Don-Chad/ninfer-3090/pull/6).
-- [iamwavecut](https://github.com/iamwavecut) contributed the swscale destination-alignment
-  JPEG safety fix in [PR #11](https://github.com/Don-Chad/ninfer-3090/pull/11).
-- [nasedkinpv](https://github.com/nasedkinpv) contributed the tool-call parser crash fix in
-  [PR #12](https://github.com/Don-Chad/ninfer-3090/pull/12).
-- [wmehanna](https://github.com/wmehanna) contributed in-place system-turn rendering for
-  Claude Code prefix reuse in [PR #13](https://github.com/Don-Chad/ninfer-3090/pull/13).
-
-## Contributing
-
-Please read the [Pull Request Policy](PR_POLICY.md) before opening an issue or pull request.
-It explains how to keep changes focused and how to document correctness, performance, VRAM, and
-compatibility evidence.
+- [Contributing](CONTRIBUTING.md)
+- [Documentation index](docs/README.md)
+- [CLI](docs/cli.md)
+- [HTTP serving](docs/serving.md)
+- [Performance](docs/performance.md)
+- [CLI examples](examples/cli/)
 
 ## License
 
-Apache License 2.0. See [LICENSE](LICENSE).
+NInfer is licensed under the [Apache License 2.0](LICENSE). This fork's modifications are under the
+same licence; see [NOTICE](NOTICE) for the attribution required by Apache-2.0 §4(b).
+
+The published artifacts are derived from
+[Qwen/Qwen3.6-27B](https://huggingface.co/Qwen/Qwen3.6-27B),
+[Qwen/Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B), and
+[Qwen/Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B). The Qwen3.6-27B NVFP4 artifact
+also uses the fixed packed weights from
+[rdtand/Qwen3.6-27B-PrismaSCOUT-Blackwell-NVFP4-BF16-vllm](https://huggingface.co/rdtand/Qwen3.6-27B-PrismaSCOUT-Blackwell-NVFP4-BF16-vllm).
+The Qwen3.8-27B NVFP4 artifact also uses the fixed mixed FP8/NVFP4 weights from
+[unsloth/Qwen3.8-27B-NVFP4](https://huggingface.co/unsloth/Qwen3.8-27B-NVFP4). These source
+repositories are distributed under Apache-2.0. Vendored dependencies retain their own license files
+under `third_party/`.

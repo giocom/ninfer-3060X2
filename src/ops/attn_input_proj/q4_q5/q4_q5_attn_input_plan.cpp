@@ -111,4 +111,22 @@ void q4_q5_attn_input_dispatch(const Tensor& x, const Weight& query_key_weight,
                                   stream);
 }
 
+bool q4_q5_attn_input_admits_shard(const Q4Q5AttnInputProblem& problem) noexcept {
+    return problem.input_rows == 5120 && problem.query_rows == 3072 && problem.kv_rows == 512 &&
+           problem.padded_k == 5120 && problem.cols >= 1;
+}
+
+void q4_q5_attn_input_dispatch_shard(const Tensor& x, const Weight& query_key_weight,
+                                     const Weight& gate_value_weight, Tensor& q, Tensor& gate,
+                                     Tensor& k, Tensor& v, cudaStream_t stream) {
+    const Q4Q5AttnInputProblem problem{x.ne[0], q.ne[0], k.ne[0], query_key_weight.padded_shape[1],
+                                       x.ne[1]};
+    if (!q4_q5_attn_input_admits_shard(problem)) {
+        throw std::invalid_argument(
+            "Q4/Q5 attention input column-parallel: exact shard problem is not admitted");
+    }
+    q4_q5_attn_input_grouped_mma_r32_c64_s4_launch(x, query_key_weight, gate_value_weight, q, gate,
+                                                   k, v, stream);
+}
+
 } // namespace ninfer::ops::detail

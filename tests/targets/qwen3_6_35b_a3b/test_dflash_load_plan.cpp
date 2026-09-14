@@ -42,7 +42,7 @@ int main() {
         if (plan.materialization.object_count != 940 ||
             plan.materialization.device_objects.size() != 883 ||
             plan.materialization.host_objects.size() != 6 ||
-            plan.materialization.device_capacity_bytes != 22'360'207'360ULL ||
+            plan.materialization.device_capacity_bytes[0] != 22'360'207'360ULL ||
             plan.bindings.dflash.feature_projection.index != 889 ||
             plan.bindings.dflash.final_norm.index != 939) {
             std::cerr << "DFlash-disabled materialization plan changed resident weights\n";
@@ -56,10 +56,10 @@ int main() {
         if (plan.materialization.object_count != 940 ||
             plan.materialization.device_objects.size() != 586 ||
             plan.materialization.host_objects.size() != 6 ||
-            plan.materialization.device_capacity_bytes != 21'591'653'888ULL) {
+            plan.materialization.device_capacity_bytes[0] != 21'591'653'888ULL) {
             std::cerr << "DFlash-enabled materialization plan is incomplete: device_objects="
                       << plan.materialization.device_objects.size()
-                      << " device_bytes=" << plan.materialization.device_capacity_bytes << '\n';
+                      << " device_bytes=" << plan.materialization.device_capacity_bytes[0] << '\n';
             return 1;
         }
     }

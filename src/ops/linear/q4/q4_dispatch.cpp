@@ -3,10 +3,32 @@
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
+namespace {
 
-Q4Launch select_q4_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
-    if (t <= 0) { throw std::invalid_argument("q4 linear: unsupported shape or T"); }
+// TP2 shard geometries. See the block comment in q5_dispatch.cpp for the two rules every
+// groupwise family follows here: shard entries are additive and never collide with a tp1 extent,
+// and a shard uses the family's generic runtime-dimension launchers rather than the parent's
+// compile-time exact instantiations (Q4's draft-head small-T table is exact in both N and K).
+// Returns nullptr when (n, k) is not a registered shard extent.
+Q4Launch select_q4_tp2_shard_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
+    const bool column_shard = (k == 5120 && (n == 512 ||    // 1024  / 2
+                                             n == 2048 ||   // 4096  / 2 (gdn/query_key)
+                                             n == 3072 ||   // 6144  / 2
+                                             n == 3584 ||   // 7168  / 2 (attention/query_key)
+                                             n == 17408 ||  // 34816 / 2 (mlp/gate_up)
+                                             n == 65536))|| // 131072/ 2 (draft_head)
+                              (k == 2048 && n == 65536);    // 131072/ 2 (draft_head, short K)
+    if (!column_shard) { return nullptr; }
+    if (t == 1) { return n >= 65536 ? launch_q4_gemv_r4_w1_direct : launch_q4_gemv_r1_w8_direct; }
+    if (t <= 4) { return launch_q4_simt_r8_c4; }
+    if (t <= 16) { return launch_q4_simt_r8_c8; }
+    return launch_q4_mma_r64_c128;
+}
 
+// The tp1 table, exactly as it was: returns nullptr rather than throwing so the caller
+// can fall back to the tp2 shard table. It is consulted FIRST, so a geometry that is
+// both registered here and listed as a shard extent keeps its tuned tp1 launcher.
+Q4Launch select_q4_a16_registered(std::int32_t n, std::int32_t k, std::int32_t t) {
     switch (k) {
     case 5120:
         switch (n) {
@@ -87,6 +109,19 @@ Q4Launch select_q4_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
         break;
     }
 
+    return nullptr;
+}
+
+} // namespace
+
+Q4Launch select_q4_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
+    if (t <= 0) { throw std::invalid_argument("q4 linear: unsupported shape or T"); }
+    if (const Q4Launch tp1 = select_q4_a16_registered(n, k, t); tp1 != nullptr) {
+        return tp1;
+    }
+    if (const Q4Launch shard = select_q4_tp2_shard_launch(n, k, t); shard != nullptr) {
+        return shard;
+    }
     throw std::invalid_argument("q4 linear: unsupported shape or T");
 }
 

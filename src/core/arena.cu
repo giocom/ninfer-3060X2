@@ -53,24 +53,11 @@ void free_pinned(void*& ptr) noexcept {
 
 } // namespace
 
-DeviceBuffer::DeviceBuffer(std::size_t size_bytes, int device_id)
-    : bytes(size_bytes), device_id(device_id) {
+DeviceBuffer::DeviceBuffer(std::size_t size_bytes) : bytes(size_bytes) {
     if (bytes == 0) { return; }
 
-    int prev_dev = 0;
-    if (device_id >= 0) {
-        cudaGetDevice(&prev_dev);
-        cudaSetDevice(device_id);
-    }
     void* ptr             = nullptr;
-    cudaError_t err       = cudaMalloc(&ptr, bytes);
-    if (err == cudaErrorMemoryAllocation) {
-        (void)cudaGetLastError();
-        err = cudaMallocManaged(&ptr, bytes, cudaMemAttachGlobal);
-    }
-    if (device_id >= 0) {
-        (void)cudaSetDevice(prev_dev);
-    }
+    const cudaError_t err = cudaMalloc(&ptr, bytes);
     if (err != cudaSuccess) {
         throw std::runtime_error(cuda_error_message("cudaMalloc failed", err));
     }
@@ -79,24 +66,20 @@ DeviceBuffer::DeviceBuffer(std::size_t size_bytes, int device_id)
 
 DeviceBuffer::~DeviceBuffer() { free_device(p); }
 
-DeviceBuffer::DeviceBuffer(DeviceBuffer&& other) noexcept
-    : p(other.p), bytes(other.bytes), device_id(other.device_id) {
-    other.p         = nullptr;
-    other.bytes     = 0;
-    other.device_id = -1;
+DeviceBuffer::DeviceBuffer(DeviceBuffer&& other) noexcept : p(other.p), bytes(other.bytes) {
+    other.p     = nullptr;
+    other.bytes = 0;
 }
 
 DeviceBuffer& DeviceBuffer::operator=(DeviceBuffer&& other) noexcept {
     if (this == &other) { return *this; }
 
     free_device(p);
-    p         = other.p;
-    bytes     = other.bytes;
-    device_id = other.device_id;
+    p     = other.p;
+    bytes = other.bytes;
 
-    other.p         = nullptr;
-    other.bytes     = 0;
-    other.device_id = -1;
+    other.p     = nullptr;
+    other.bytes = 0;
     return *this;
 }
 
@@ -148,36 +131,24 @@ DeviceArena::Scope::Scope(Scope&& other) noexcept
     other.arena_ = nullptr;
 }
 
-DeviceArena::DeviceArena(std::size_t capacity_bytes, int device_id)
-    : cap_(capacity_bytes), device_id_(device_id) {
+DeviceArena::DeviceArena(std::size_t capacity_bytes) {
     if (capacity_bytes == 0) {
         throw std::invalid_argument("DeviceArena capacity must be nonzero");
     }
 
-    int prev_dev = 0;
-    if (device_id >= 0) {
-        cudaGetDevice(&prev_dev);
-        cudaSetDevice(device_id);
-    }
     void* ptr             = nullptr;
-    cudaError_t err       = cudaMalloc(&ptr, capacity_bytes);
-    if (err == cudaErrorMemoryAllocation) {
-        (void)cudaGetLastError();
-        err = cudaMallocManaged(&ptr, capacity_bytes, cudaMemAttachGlobal);
-    }
-    if (device_id >= 0) {
-        (void)cudaSetDevice(prev_dev);
-    }
+    const cudaError_t err = cudaMalloc(&ptr, capacity_bytes);
     if (err != cudaSuccess) {
         throw std::runtime_error(cuda_error_message("cudaMalloc failed", err));
     }
 
     base_ = ptr;
+    cap_  = capacity_bytes;
     off_  = 0;
 }
 
-DeviceArena::DeviceArena(DeviceSpan storage, int device_id)
-    : base_(storage.data), cap_(storage.bytes), device_id_(device_id), owns_(false) {
+DeviceArena::DeviceArena(DeviceSpan storage)
+    : base_(storage.data), cap_(storage.bytes), owns_(false) {
     if (base_ == nullptr || cap_ == 0) {
         throw std::invalid_argument("borrowed DeviceArena storage must be non-empty");
     }

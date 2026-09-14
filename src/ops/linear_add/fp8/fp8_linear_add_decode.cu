@@ -39,10 +39,22 @@ void fp8_linear_add_decode_launch(const Tensor& x, const Weight& weight, Tensor&
     case Fp8Problem::Residual17408:
         launch<Fp8Residual17408Geometry>(x, weight, residual, stream);
         return;
+    // linear_add's own tp2 row shards -- the SAME kernel template instantiated at the
+    // halved K, exactly as NVFP4's and Q5's own linear_add shards are served.
+    case Fp8Problem::Residual6144Tp2Row:
+        launch<Fp8Residual6144Tp2RowGeometry>(x, weight, residual, stream);
+        return;
+    case Fp8Problem::Residual17408Tp2Row:
+        launch<Fp8Residual17408Tp2RowGeometry>(x, weight, residual, stream);
+        return;
     case Fp8Problem::AttnInput:
     case Fp8Problem::GdnInput:
     case Fp8Problem::MlpGateUp:
     case Fp8Problem::Vocabulary:
+    case Fp8Problem::VocabularyTp2Column:
+    case Fp8Problem::GdnInputTp2Column:
+    case Fp8Problem::MlpGateUpTp2Column:
+    case Fp8Problem::AttnInputTp2Column:
         break;
     }
     throw std::invalid_argument("fp8 linear_add: unsupported problem");

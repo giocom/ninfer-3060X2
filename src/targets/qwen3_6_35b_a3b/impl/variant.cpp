@@ -7,7 +7,9 @@
 #include "ninfer/ops/sparse_moe.h"
 
 #include <algorithm>
+#include <array>
 #include <stdexcept>
+#include <string>
 
 #define NINFER_QWEN36_VARIANT    ::ninfer::targets::qwen3_6_35b_a3b::detail::Variant
 #define NINFER_QWEN36_RUNTIME_NS qwen3_6_35b_a3b_runtime
@@ -318,6 +320,115 @@ std::size_t Variant::mtp_post_mixer_workspace_capacity_bytes(std::int32_t first,
                                                              std::int32_t last) {
     return ops::sparse_moe_workspace_capacity_bytes(QType::W8G32_F16S, QType::W8G32_F16S, first,
                                                     last);
+}
+
+
+// --- tp == 2 split leaves: unsupported for this variant ------------------------------------------
+namespace {
+
+[[noreturn]] void reject_tensor_parallel(const char* leaf) {
+    throw std::logic_error(std::string("qwen3_6_35b_a3b has no tensor-parallel path for ") + leaf);
+}
+
+} // namespace
+
+void Variant::attention_projection(const std::array<Tensor, 2>&,
+                                   const std::array<const FullAttentionProjectionWeights*, 2>&,
+                                   const std::array<Tensor, 2>&, const std::array<Tensor, 2>&,
+                                   const std::array<Tensor, 2>&, const std::array<Tensor, 2>&,
+                                   qwen3_6::TextPhase, const std::array<WorkspaceArena*, 2>&,
+                                   const ExecutionContext&) {
+    reject_tensor_parallel("attention_projection");
+}
+
+void Variant::attention_output_projection(const std::array<Tensor, 2>&,
+                                          const std::array<Weight, 2>&,
+                                          const std::array<Tensor, 2>&,
+                                          const std::array<Tensor, 2>&, qwen3_6::TextPhase,
+                                          const std::array<WorkspaceArena*, 2>&,
+                                          const ExecutionContext&, const ops::PeerEvents&) {
+    reject_tensor_parallel("attention_output_projection");
+}
+
+void Variant::gdn_input_projection(const std::array<Tensor, 2>&,
+                                   const std::array<const GdnProjectionWeights*, 2>&,
+                                   const std::array<Tensor, 2>&, const std::array<Tensor, 2>&,
+                                   qwen3_6::TextPhase, const std::array<WorkspaceArena*, 2>&,
+                                   const ExecutionContext&) {
+    reject_tensor_parallel("gdn_input_projection");
+}
+
+void Variant::gdn_input_projection_snapshot(
+    const std::array<Tensor, 2>&, const std::array<const GdnProjectionWeights*, 2>&,
+    const std::array<Tensor, 2>&, const std::array<Tensor, 2>&, const std::array<Tensor, 2>&,
+    const std::array<Tensor, 2>&, const std::array<Tensor, 2>&, const std::array<Tensor, 2>&,
+    const std::array<Tensor, 2>&, const std::array<Tensor, 2>&, const std::array<Tensor, 2>&,
+    qwen3_6::TextPhase, const std::array<WorkspaceArena*, 2>&, const ExecutionContext&) {
+    reject_tensor_parallel("gdn_input_projection_snapshot");
+}
+
+void Variant::gdn_output_projection(const std::array<Tensor, 2>&, const std::array<Weight, 2>&,
+                                    const std::array<Tensor, 2>&, const std::array<Tensor, 2>&,
+                                    qwen3_6::TextPhase, const std::array<WorkspaceArena*, 2>&,
+                                    const ExecutionContext&, const ops::PeerEvents&) {
+    reject_tensor_parallel("gdn_output_projection");
+}
+
+void Variant::gdn_control_projection(const std::array<Tensor, 2>&,
+                                     const std::array<const GdnProjectionWeights*, 2>&,
+                                     const std::array<Tensor, 2>&, const std::array<Tensor, 2>&,
+                                     const std::array<WorkspaceArena*, 2>&,
+                                     const ExecutionContext&) {
+    reject_tensor_parallel("gdn_control_projection");
+}
+
+void Variant::post_mixer(const std::array<Tensor, 2>&,
+                         const std::array<const PostMixerWeights*, 2>&,
+                         const std::array<Tensor, 2>&, const std::array<Tensor, 2>&,
+                         qwen3_6::TextPhase, const std::array<WorkspaceArena*, 2>&,
+                         const ExecutionContext&, const ops::PeerEvents&) {
+    reject_tensor_parallel("post_mixer");
+}
+
+void Variant::gdn_input_projection_record(
+    const std::array<Tensor, 2>&, const std::array<const GdnProjectionWeights*, 2>&,
+    const std::array<Tensor, 2>&, const std::array<Tensor, 2>&, const std::array<Tensor, 2>&,
+    const std::array<Tensor, 2>&, const std::array<Tensor, 2>&, const std::array<Tensor, 2>&,
+    const std::array<Tensor, 2>&, const std::array<Tensor, 2>&, const std::array<Tensor, 2>&,
+    qwen3_6::TextPhase, const std::array<WorkspaceArena*, 2>&, const ExecutionContext&) {
+    reject_tensor_parallel("gdn_input_projection_record");
+}
+
+void Variant::mtp_attention_projection(const std::array<Tensor, 2>&,
+                                       const std::array<const MtpAttentionProjectionWeights*, 2>&,
+                                       const std::array<Tensor, 2>&, const std::array<Tensor, 2>&,
+                                       const std::array<Tensor, 2>&, const std::array<Tensor, 2>&,
+                                       const std::array<WorkspaceArena*, 2>&,
+                                       const ExecutionContext&) {
+    reject_tensor_parallel("mtp_attention_projection");
+}
+
+void Variant::mtp_kv_projection(const std::array<Tensor, 2>&,
+                                const std::array<const MtpAttentionProjectionWeights*, 2>&,
+                                const std::array<Tensor, 2>&, const std::array<Tensor, 2>&,
+                                const std::array<WorkspaceArena*, 2>&, const ExecutionContext&) {
+    reject_tensor_parallel("mtp_kv_projection");
+}
+
+void Variant::mtp_q_gate_projection(const std::array<Tensor, 2>&,
+                                    const std::array<const MtpAttentionProjectionWeights*, 2>&,
+                                    const std::array<Tensor, 2>&, const std::array<Tensor, 2>&,
+                                    const std::array<WorkspaceArena*, 2>&,
+                                    const ExecutionContext&) {
+    reject_tensor_parallel("mtp_q_gate_projection");
+}
+
+void Variant::mtp_post_mixer(const std::array<Tensor, 2>&,
+                             const std::array<const MtpPostMixerWeights*, 2>&,
+                             const std::array<Tensor, 2>&, const std::array<Tensor, 2>&,
+                             const std::array<WorkspaceArena*, 2>&, const ExecutionContext&,
+                             const ops::PeerEvents&) {
+    reject_tensor_parallel("mtp_post_mixer");
 }
 
 } // namespace ninfer::targets::qwen3_6_35b_a3b::detail

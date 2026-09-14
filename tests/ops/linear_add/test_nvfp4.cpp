@@ -123,15 +123,8 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
         const std::size_t capacity = ops::linear_add_workspace_capacity_bytes(
             QType::NVFP4, n, k, invocation.policy, invocation.tokens, invocation.tokens);
         WorkspaceArena workspace(std::max<std::size_t>(capacity, 256));
-        try {
-            ops::linear_add(x, weight, residual, invocation.policy, workspace, nullptr);
-            cuda_check(cudaDeviceSynchronize(), "synchronize NVFP4 linear_add");
-        } catch (const std::exception& error) {
-            if (!unsupported_arch_refusal(error)) { throw; }
-            std::cout << "SKIP NVFP4 linear_add T=" << invocation.tokens << ": "
-                      << error.what() << "\n";
-            continue;
-        }
+        ops::linear_add(x, weight, residual, invocation.policy, workspace, nullptr);
+        cuda_check(cudaDeviceSynchronize(), "synchronize NVFP4 linear_add");
 
         const bool a4           = invocation.policy == ops::LinearPolicy::AllowA4;
         const std::string label = "NVFP4 linear_add [" + std::to_string(n) + "," +

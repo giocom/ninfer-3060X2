@@ -93,6 +93,53 @@ struct RowScaleGeometry {
 
 RowScaleGeometry row_scale_geometry(NumericFormat format, std::span<const std::uint64_t> shape);
 
+// --- Tensor slicing (TP2 sharded materialization) ---------------------------------------------
+//
+// A shard of a tensor is a *standalone tensor of the same layout and format* whose logical shape
+// is the parent's with one axis narrowed. Producing one is a pure byte operation: no layout of
+// ours interleaves logical values with anything that has to be recomputed, so a shard is always
+// some list of contiguous parent byte ranges copied into the shard's own plane offsets. Those
+// ranges are what `TensorSlice` carries; the geometry that decides them is documented in
+// docs/maintainer/storage-layouts.md and re-derived per layout in storage_layouts.cpp.
+
+// One contiguous byte range copied from a parent payload into a shard.
+struct PlaneCopy {
+    std::uint64_t source_offset = 0; // relative to the parent object's payload begin
+    std::uint64_t dest_offset   = 0; // relative to the shard's own payload begin
+    std::uint64_t bytes         = 0;
+};
+
+// A half-open [begin, begin + count) range along the sliced axis, in logical coordinates.
+struct SliceRange {
+    std::uint64_t begin = 0;
+    std::uint64_t count = 0;
+};
+
+struct TensorSlice {
+    // The shard's own encoded size, i.e. tensor_encoded_size() of the narrowed logical shape.
+    std::uint64_t encoded_bytes = 0;
+    std::vector<PlaneCopy> copies;
+};
+
+// Row (axis 0) slice. The shard is the concatenation of `rows` in the order given; the ranges
+// must be nonempty, ascending, disjoint, and inside the tensor. Multiple ranges exist because a
+// fused object (attention query|key|gate|value, MLP gate|up) contributes one row block per fused
+// sub-matrix to each device.
+TensorSlice tensor_row_slice(StorageLayout layout, NumericFormat format,
+                             std::span<const std::uint64_t> shape,
+                             std::span<const SliceRange> rows);
+
+// Column (axis 1) slice, rank two only. The shard is the concatenation of `columns` within every
+// row, in the order given; the ranges must be nonempty, ascending, disjoint, and inside the
+// tensor. Only contiguous-le-v1 accepts more than one range -- every other layout groups, tiles,
+// or swizzles along the column axis, so a multi-range shard would not reconstruct into its own
+// geometry, and >1 range is rejected there. Multiple ranges exist because a depthwise object whose
+// channel axis is the column axis (GDN `gdn/convolution`, 10240 = Q|K|V) contributes one channel
+// block per fused section to each device, exactly as `tensor_row_slice` does for fused GEMMs.
+TensorSlice tensor_column_slice(StorageLayout layout, NumericFormat format,
+                                std::span<const std::uint64_t> shape,
+                                std::span<const SliceRange> columns);
+
 struct TensorDescriptor {
     std::string name;
     std::vector<std::uint64_t> shape;

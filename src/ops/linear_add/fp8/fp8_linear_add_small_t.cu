@@ -62,6 +62,16 @@ struct Fp8LinearAddSmallTProductionSchedule<Fp8Residual17408Geometry, ActiveToke
                           Fp8SmallTActivationAccess::TokenPacked, kCodeCache, 1, kBlockOrder, 1>;
 };
 
+// linear_add's tp2 row shards inherit their parent's measured small-T schedule: tuning is
+// inherited from the tp1 parent family, never re-measured for the shard.
+template <int ActiveTokens>
+struct Fp8LinearAddSmallTProductionSchedule<Fp8Residual6144Tp2RowGeometry, ActiveTokens>
+    : Fp8LinearAddSmallTProductionSchedule<Fp8Residual6144Geometry, ActiveTokens> {};
+
+template <int ActiveTokens>
+struct Fp8LinearAddSmallTProductionSchedule<Fp8Residual17408Tp2RowGeometry, ActiveTokens>
+    : Fp8LinearAddSmallTProductionSchedule<Fp8Residual17408Geometry, ActiveTokens> {};
+
 template <class Geometry, int ActiveTokens>
 void launch_exact(const Tensor& x, const Weight& weight, Tensor& residual, cudaStream_t stream) {
     using Schedule = typename Fp8LinearAddSmallTProductionSchedule<Geometry, ActiveTokens>::Type;
@@ -106,10 +116,20 @@ void fp8_linear_add_small_t_launch(const Tensor& x, const Weight& weight, Tensor
     case Fp8Problem::Residual17408:
         launchers<Fp8Residual17408Geometry>()[index](x, weight, residual, stream);
         return;
+    case Fp8Problem::Residual6144Tp2Row:
+        launchers<Fp8Residual6144Tp2RowGeometry>()[index](x, weight, residual, stream);
+        return;
+    case Fp8Problem::Residual17408Tp2Row:
+        launchers<Fp8Residual17408Tp2RowGeometry>()[index](x, weight, residual, stream);
+        return;
     case Fp8Problem::AttnInput:
     case Fp8Problem::GdnInput:
     case Fp8Problem::MlpGateUp:
     case Fp8Problem::Vocabulary:
+    case Fp8Problem::VocabularyTp2Column:
+    case Fp8Problem::GdnInputTp2Column:
+    case Fp8Problem::MlpGateUpTp2Column:
+    case Fp8Problem::AttnInputTp2Column:
         break;
     }
     throw std::invalid_argument("fp8 linear_add small-T: unsupported problem");

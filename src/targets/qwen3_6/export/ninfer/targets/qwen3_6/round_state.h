@@ -33,8 +33,7 @@ struct OrdinaryDecodeIngress {
     std::array<std::int32_t, kMaximumConcurrency> cache_positions{};
     std::array<std::int32_t, kMaximumConcurrency> rope_positions{};
     std::array<std::int32_t, kMaximumConcurrency> text_kv_table_rows{};
-    std::array<std::int32_t, kMaximumConcurrency> state_source_slots{};
-    std::array<std::int32_t, kMaximumConcurrency> state_destination_slots{};
+    std::array<std::int32_t, kMaximumConcurrency> lanes{};
     std::array<ops::SamplingConfig, kMaximumConcurrency> sampling{};
 };
 
@@ -54,8 +53,7 @@ struct MtpDecodeIngress {
     std::array<std::int32_t, kMaximumConcurrency * kMtpDecodeMaximumWidth> target_rope_positions{};
     std::array<std::int32_t, kMaximumConcurrency> text_kv_table_rows{};
     std::array<std::int32_t, kMaximumConcurrency> mtp_kv_table_rows{};
-    std::array<std::int32_t, kMaximumConcurrency> state_source_slots{};
-    std::array<std::int32_t, kMaximumConcurrency> state_destination_slots{};
+    std::array<std::int32_t, kMaximumConcurrency> lanes{};
     std::array<std::int32_t, kMaximumConcurrency> rope_deltas{};
     std::array<ops::SamplingConfig, kMaximumConcurrency> sampling{};
 };
@@ -79,9 +77,7 @@ struct DFlashDecodeIngress {
     std::array<std::int32_t, kMaximumConcurrency> target_valid_columns{};
     std::array<std::int32_t, kMaximumConcurrency> text_kv_table_rows{};
     std::array<std::int32_t, kMaximumConcurrency> dflash_kv_table_rows{};
-    std::array<std::int32_t, kMaximumConcurrency> active_lanes{};
-    std::array<std::int32_t, kMaximumConcurrency> state_source_slots{};
-    std::array<std::int32_t, kMaximumConcurrency> state_destination_slots{};
+    std::array<std::int32_t, kMaximumConcurrency> lanes{};
     std::array<ops::SamplingConfig, kMaximumConcurrency> sampling{};
 };
 
@@ -168,8 +164,7 @@ struct OrdinaryDecodeState {
     Tensor cache_positions;
     Tensor rope_positions;
     Tensor text_kv_table_rows;
-    Tensor state_source_slots;
-    Tensor state_destination_slots;
+    Tensor lanes;
     const ops::SamplingConfig* sampling = nullptr;
     Tensor sampled_tokens;
     Tensor logits;
@@ -217,8 +212,7 @@ struct MtpDecodeState {
     Tensor target_rope_positions;
     Tensor text_kv_table_rows;
     Tensor mtp_kv_table_rows;
-    Tensor state_source_slots;
-    Tensor state_destination_slots;
+    Tensor lanes;
     Tensor rope_deltas;
     const ops::SamplingConfig* sampling = nullptr;
     Tensor licensed_tokens;
@@ -256,9 +250,7 @@ struct DFlashDecodeState {
     Tensor target_valid_columns;
     Tensor text_kv_table_rows;
     Tensor dflash_kv_table_rows;
-    Tensor active_lanes;
-    Tensor state_source_slots;
-    Tensor state_destination_slots;
+    Tensor lanes;
     const ops::SamplingConfig* sampling = nullptr;
     Tensor licensed_tokens;
     Tensor licensed_counts;

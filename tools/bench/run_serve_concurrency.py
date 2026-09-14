@@ -150,9 +150,38 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--port", type=int, default=8080, help="loopback serving port")
     parser.add_argument("--device", type=int, default=0, help="CUDA device index")
     parser.add_argument(
+        "--tp",
+        type=int,
+        default=1,
+        choices=(1, 2),
+        help="tensor-parallel degree passed to ninfer-serve (default: 1)",
+    )
+    parser.add_argument(
+        "--devices",
+        default=None,
+        metavar="N,N",
+        help="comma-separated device ids, one per --tp rank (required when --tp 2)",
+    )
+    parser.add_argument(
         "--dry-run", action="store_true", help="print point commands and request counts only"
     )
     return parser.parse_args(argv)
+
+
+def parse_devices(args: argparse.Namespace) -> list[int]:
+    if args.devices is None:
+        if args.tp != 1:
+            raise corpus.CampaignError("--devices is required when --tp 2")
+        return [args.device]
+    try:
+        devices = [int(token) for token in args.devices.split(",")]
+    except ValueError as exc:
+        raise corpus.CampaignError(f"invalid --devices value {args.devices!r}") from exc
+    if len(devices) != args.tp:
+        raise corpus.CampaignError("--devices must list exactly --tp device ids")
+    if devices[0] != args.device:
+        raise corpus.CampaignError("--device and --devices disagree on the primary device")
+    return devices
 
 
 def validate_args(args: argparse.Namespace) -> None:
@@ -160,6 +189,7 @@ def validate_args(args: argparse.Namespace) -> None:
         raise corpus.CampaignError("--port must be in [1, 65535]")
     if args.device < 0:
         raise corpus.CampaignError("--device must be nonnegative")
+    parse_devices(args)
     if args.max_context <= 0:
         raise corpus.CampaignError("--max-context must be positive")
     if args.decode_tokens <= 0:
@@ -309,6 +339,8 @@ def server_command(
         "int8",
         "--no-prefix-reuse",
     ]
+    if args.tp != 1:
+        command.extend(["--tp", str(args.tp), "--devices", ",".join(str(d) for d in parse_devices(args))])
     if point.speculative_backend != "none":
         command.extend(
             [

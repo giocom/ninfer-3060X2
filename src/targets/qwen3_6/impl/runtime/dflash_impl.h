@@ -4,8 +4,9 @@
 
 #include "ninfer/ops/argmax.h"
 #include "ninfer/ops/attn_input_proj.h"
+#include "ninfer/ops/bidirectional_gqa_attention.h"
 #include "ninfer/ops/embedding.h"
-#include "ninfer/ops/kv_cache_append.h"
+#include "ninfer/ops/kv_cache_append_prefix.h"
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/linear_add.h"
 #include "ninfer/ops/linear_pair.h"
@@ -14,11 +15,10 @@
 #include "ninfer/ops/prepare_ragged_prefix.h"
 #include "ninfer/ops/rmsnorm.h"
 #include "ninfer/ops/rope.h"
-#include "ninfer/ops/scalar.h"
 #include "ninfer/ops/scatter.h"
-#include "ninfer/ops/sliding_window_attention.h"
-#include "ninfer/ops/softmax_attention.h"
+#include "ninfer/ops/scalar.h"
 #include "ninfer/ops/speculative_round.h"
+#include "ninfer/ops/swa.h"
 
 #include <cuda_runtime.h>
 
@@ -191,7 +191,7 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
         Tensor anchors             = frame.anchors.slice(0, 0, batch_size);
         Tensor frontiers           = frame.execution_frontiers.slice(0, 0, batch_size);
         Tensor valid_columns       = frame.target_valid_columns.slice(0, 0, batch_size);
-        Tensor state_destinations  = frame.state_destination_slots.slice(0, 0, batch_size);
+        Tensor lanes               = frame.lanes.slice(0, 0, batch_size);
         Tensor full_rows           = frame.dflash_kv_table_rows.slice(0, 0, batch_size);
         Tensor ids                 = frame.proposal_ids.slice(1, 0, batch_size);
         Tensor positions           = frame.proposal_positions.slice(1, 0, batch_size);
@@ -239,18 +239,14 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
                 Tensor attention_batch = roots.attention.view(
                     {Config::head_dim, Config::query_heads, width, batch_size});
                 if (layer < Config::local_layers) {
-                    ops::sliding_window_attention(
-                        query_batch, key_batch, value_batch, positions, valid_columns,
-                        state_destinations,
-                        {Config::head_dim, Config::query_heads, Config::kv_heads},
-                        Config::local_capacity, Config::attention_scale,
-                        dflash_state(state).local_layer(static_cast<std::uint32_t>(layer)),
-                        envelopes.local, state.execution.work, attention_batch,
-                        state.execution.device.stream);
+                    ops::swa(query_batch, key_batch, value_batch, positions, valid_columns, lanes,
+                             Config::attention_scale,
+                             dflash_state(state).local_layer(static_cast<std::uint32_t>(layer)),
+                             envelopes.local, state.execution.work, attention_batch,
+                             state.execution.device.stream);
                 } else {
-                    ops::context_softmax_attention(
+                    ops::bidirectional_gqa_attention(
                         query_batch, key_batch, value_batch, frontiers, valid_columns, full_rows,
-                        {Config::head_dim, Config::query_heads, Config::kv_heads},
                         Config::attention_scale, dflash_state(state).full_batch_layer(0),
                         envelopes.full, state.execution.work, attention_batch,
                         state.execution.device.stream);
@@ -314,7 +310,7 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
 
 auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size, std::uint32_t k,
                               DFlashEnvelopes envelopes,
-                              ops::CausalAttentionExecutionEnvelope target_envelope) {
+                              ops::GqaExecutionEnvelope target_envelope) {
     return [&state, batch_size, k, envelopes, target_envelope] {
         if (batch_size <= 0 || batch_size > static_cast<std::int32_t>(kMaximumConcurrency) ||
             k == 0 || k > kDFlashDecodeMaximumDrafts) {
@@ -326,71 +322,68 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                                    sizeof(qwen3_6::DFlashDecodeIngress), cudaMemcpyHostToDevice,
                                    state.execution.device.stream));
 
-        Tensor anchors            = frame.anchors.slice(0, 0, batch_size);
-        Tensor frontiers          = frame.execution_frontiers.slice(0, 0, batch_size);
-        Tensor context_starts     = frame.context_frontiers.slice(0, 0, batch_size);
-        Tensor extents            = frame.proposal_extents.slice(0, 0, batch_size);
-        Tensor valid_columns      = frame.target_valid_columns.slice(0, 0, batch_size);
-        Tensor text_rows          = frame.text_kv_table_rows.slice(0, 0, batch_size);
-        Tensor dflash_rows        = frame.dflash_kv_table_rows.slice(0, 0, batch_size);
-        Tensor active_lanes       = frame.active_lanes.slice(0, 0, batch_size);
-        Tensor state_sources      = frame.state_source_slots.slice(0, 0, batch_size);
-        Tensor state_destinations = frame.state_destination_slots.slice(0, 0, batch_size);
-        Tensor append_positions   = frame.append_positions.slice(1, 0, batch_size);
-        Tensor append_counts      = frame.append_counts.slice(0, 0, batch_size);
-        Tensor drafts             = frame.draft_tokens.slice(1, 0, batch_size);
-        Tensor verify_ids         = frame.verify_ids.slice(1, 0, batch_size);
-        Tensor target_positions   = frame.proposal_positions.slice(1, 0, batch_size);
-        Tensor target_tokens      = frame.target_argmax.slice(1, 0, batch_size);
-        Tensor target_logits      = frame.target_logits.slice(2, 0, batch_size);
-        Tensor target_hidden      = frame.target_hidden.slice(2, 0, batch_size);
-        Tensor selected_hidden    = frame.target_continuation_hidden.slice(1, 0, batch_size);
-        Tensor licensed_tokens    = frame.licensed_tokens.slice(1, 0, batch_size);
-        Tensor licensed_counts    = frame.licensed_counts.slice(0, 0, batch_size);
-        Tensor accepted           = frame.accepted_drafts.slice(0, 0, batch_size);
+        Tensor anchors          = frame.anchors.slice(0, 0, batch_size);
+        Tensor frontiers        = frame.execution_frontiers.slice(0, 0, batch_size);
+        Tensor context_starts   = frame.context_frontiers.slice(0, 0, batch_size);
+        Tensor extents          = frame.proposal_extents.slice(0, 0, batch_size);
+        Tensor valid_columns    = frame.target_valid_columns.slice(0, 0, batch_size);
+        Tensor text_rows        = frame.text_kv_table_rows.slice(0, 0, batch_size);
+        Tensor dflash_rows      = frame.dflash_kv_table_rows.slice(0, 0, batch_size);
+        Tensor lanes            = frame.lanes.slice(0, 0, batch_size);
+        Tensor append_positions = frame.append_positions.slice(1, 0, batch_size);
+        Tensor append_counts    = frame.append_counts.slice(0, 0, batch_size);
+        Tensor drafts           = frame.draft_tokens.slice(1, 0, batch_size);
+        Tensor verify_ids       = frame.verify_ids.slice(1, 0, batch_size);
+        Tensor target_positions = frame.proposal_positions.slice(1, 0, batch_size);
+        Tensor target_tokens    = frame.target_argmax.slice(1, 0, batch_size);
+        Tensor target_logits    = frame.target_logits.slice(2, 0, batch_size);
+        Tensor target_hidden    = frame.target_hidden.slice(2, 0, batch_size);
+        Tensor selected_hidden  = frame.target_continuation_hidden.slice(1, 0, batch_size);
+        Tensor licensed_tokens  = frame.licensed_tokens.slice(1, 0, batch_size);
+        Tensor licensed_counts  = frame.licensed_counts.slice(0, 0, batch_size);
+        Tensor accepted         = frame.accepted_drafts.slice(0, 0, batch_size);
 
         state.execution.work.reset();
         Tensor compact_features = state.execution.work.alloc(
             DType::BF16, {Variant::DFlashConfig::feature_rows, width, batch_size});
-        ops::prepare_ragged_prefix(dflash_state(state).pending_features, active_lanes,
-                                   context_starts, frontiers, compact_features, append_positions,
-                                   append_counts, state.execution.device.stream);
+        ops::prepare_ragged_prefix(dflash_state(state).pending_features, lanes, context_starts,
+                                   frontiers, compact_features, append_positions, append_counts,
+                                   state.execution.device.stream);
         append_context_impl<Variant>(state, compact_features, append_positions, append_counts,
-                                     state_destinations, dflash_rows, envelopes.append);
+                                     lanes, dflash_rows, envelopes.append);
 
         propose_batch_impl<Variant>(state, frame, batch_size, k, envelopes);
         ops::speculative_prepare_verify_ids(anchors, drafts, extents, verify_ids,
                                             state.execution.device.stream);
 
-        TextContext card(state.execution.device, state.execution.model, state.execution.work, {},
-                         state.execution.linear_attention, state.execution.io,
-                         state.execution.prefill_hidden, state.execution.prefill_chunk, 0, {},
-                         &state.text_cache);
+        TextContext card(state.execution.device, state.execution.model, state.execution.work,
+                         state.execution.rope_frequency, {}, state.execution.linear_attention,
+                         state.execution.io, state.execution.prefill_hidden,
+                         state.execution.prefill_chunk, 0, {}, &state.text_cache);
         DFlashFeatureSink sink =
-            batch_feature_sink_impl<Variant>(state, active_lanes, valid_columns, width, batch_size);
+            batch_feature_sink_impl<Variant>(state, lanes, valid_columns, width, batch_size);
         target_verify_accept(state.execution, state.continuation_hidden_store, card,
                              TargetVerifyFrameView{
-                                 .ids                     = verify_ids,
-                                 .cache_positions         = target_positions,
-                                 .rope_positions          = target_positions,
-                                 .valid_columns           = valid_columns,
-                                 .kv_table_rows           = text_rows,
-                                 .state_source_slots      = state_sources,
-                                 .state_destination_slots = state_destinations,
-                                 .target_hidden           = target_hidden,
-                                 .target_logits           = target_logits,
-                                 .target_tokens           = target_tokens,
-                                 .drafts                  = drafts,
-                                 .current_extents         = extents,
-                                 .frontiers               = frontiers,
-                                 .anchors                 = anchors,
-                                 .licensed_tokens         = licensed_tokens,
-                                 .licensed_counts         = licensed_counts,
-                                 .accepted_drafts         = accepted,
-                                 .selected_hidden         = selected_hidden,
-                                 .replay_records          = state.execution.replay_records,
-                                 .sampling                = frame.sampling,
-                                 .feature_sink            = &sink,
+                                 .ids             = verify_ids,
+                                 .cache_positions = target_positions,
+                                 .rope_positions  = target_positions,
+                                 .valid_columns   = valid_columns,
+                                 .kv_table_rows   = text_rows,
+                                 .lanes           = lanes,
+                                 .target_hidden   = target_hidden,
+                                 .target_logits   = target_logits,
+                                 .target_tokens   = target_tokens,
+                                 .drafts          = drafts,
+                                 .current_extents = extents,
+                                 .frontiers       = frontiers,
+                                 .anchors         = anchors,
+                                 .licensed_tokens = licensed_tokens,
+                                 .licensed_counts = licensed_counts,
+                                 .accepted_drafts = accepted,
+                                 .selected_hidden = selected_hidden,
+                                 .replay_records  = state.execution.replay_records,
+                                 .sampling        = frame.sampling,
+                                 .feature_sink    = &sink,
                              },
                              target_envelope);
         CUDA_CHECK(cudaMemcpyAsync(&state.host_egress, frame.egress.data,
@@ -424,15 +417,14 @@ void dflash_append_context(PrefillContext& state, const Tensor& features, const 
 
 void capture_dflash_decode_batch(DFlashBatchContext& state, std::int32_t batch_size,
                                  std::uint32_t k, DFlashEnvelopes envelopes,
-                                 ops::CausalAttentionExecutionEnvelope target_envelope,
+                                 ops::GqaExecutionEnvelope target_envelope,
                                  DecodeGraphDefinition& definition) {
     auto body = dflash_decode_batch_body(state, batch_size, k, envelopes, target_envelope);
     capture_graph(state, definition, body);
 }
 
 void dflash_decode_batch(DFlashBatchContext& state, std::int32_t batch_size, std::uint32_t k,
-                         DFlashEnvelopes envelopes,
-                         ops::CausalAttentionExecutionEnvelope target_envelope,
+                         DFlashEnvelopes envelopes, ops::GqaExecutionEnvelope target_envelope,
                          DecodeGraphExecutable* executable) {
     auto body = dflash_decode_batch_body(state, batch_size, k, envelopes, target_envelope);
     run_prepared(state, executable, body);

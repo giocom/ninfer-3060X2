@@ -89,16 +89,14 @@ Package::construct_loaded_model(LoadPlan&& plan, artifact::MaterializedArtifact&
 
 Package::Frontend Package::make_frontend(const LoadedModel& model, const EngineOptions& options) {
     if (model.impl_ == nullptr) { throw std::invalid_argument("loaded model is empty"); }
-    return qwen3_6::make_frontend(
-        model.impl_->data.frontend,
-        qwen3_6::FrontendOptions{
-            .vision_enabled                = model.impl_->data.runtime.features.vision,
-            .max_context                   = options.max_context,
-            .media_cache_bytes             = options.media_cache_bytes,
-            .media_live_bytes              = options.media_live_bytes,
-            .media_preprocess_threads      = options.media_preprocess_threads,
-            .max_cache_markers_per_request = *options.context_cache.max_cache_markers_per_request,
-        });
+    return qwen3_6::make_frontend(model.impl_->data.frontend,
+                                  qwen3_6::FrontendOptions{
+                                      .vision_enabled = model.impl_->data.runtime.features.vision,
+                                      .max_context    = options.max_context,
+                                      .media_cache_bytes        = options.media_cache_bytes,
+                                      .media_live_bytes         = options.media_live_bytes,
+                                      .media_preprocess_threads = options.media_preprocess_threads,
+                                  });
 }
 
 Package::SequencePlanner Package::make_sequence_planner(DeviceContext& device,
@@ -108,10 +106,15 @@ Package::SequencePlanner Package::make_sequence_planner(DeviceContext& device,
 }
 
 std::unique_ptr<Package::Program>
-Package::create_program(const LoadedModel& model, SequencePlan&& plan, DeviceContext& device) {
+Package::create_program(const LoadedModel& model, SequencePlan&& plan,
+                        ExecutionContext& execution) {
     if (model.impl_ == nullptr) { throw std::invalid_argument("loaded model is empty"); }
-    return qwen3_6::create_program<detail::Variant>(
-        model.impl_->data.runtime, model.impl_->weights_profile, std::move(plan), device);
+    if (execution.tp != 1) {
+        throw std::invalid_argument("qwen3_6_35b_a3b has no tensor-parallel execution path");
+    }
+    return qwen3_6::create_program<detail::Variant>(model.impl_->data.runtime, nullptr,
+                                                   model.impl_->weights_profile, std::move(plan),
+                                                   execution);
 }
 
 } // namespace ninfer::targets::qwen3_6_35b_a3b

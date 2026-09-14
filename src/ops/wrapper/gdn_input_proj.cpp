@@ -1,6 +1,7 @@
 #include "ninfer/ops/gdn_input_proj.h"
 
 #include "core/layout.h"
+#include "ops/common/split_launch.h"
 #include "ops/gdn_input_proj/fp8/fp8_gdn_conv_plan.h"
 #include "ops/gdn_input_proj/fp8/fp8_gdn_input_plan.h"
 #include "ops/gdn_input_proj/gdn_projected_conv.h"
@@ -1050,6 +1051,584 @@ void gdn_input_proj_conv_record(const Tensor& x, const Weight& query_key_value_z
     dispatch_single_parent_record(x, query_key_value_z_weight, conv_weight, conv_states,
                                   valid_columns, initial_state_slots, conv_record, query, key,
                                   value, z, LinearPolicy::A16Only, workspace, stream);
+}
+
+// --- Tensor-parallel split form (tp == 2) -------------------------------------------------------
+// See include/ninfer/ops/gdn_input_proj.h for the full design note (ShardPlan section layout, the
+// output contract the GDN core reads, and which formats are registered).
+namespace {
+
+constexpr std::int32_t kShardHidden       = 5120;
+constexpr std::int32_t kShardQkvRows      = 5120;
+constexpr std::int32_t kShardZRows        = 3072;
+constexpr std::int32_t kShardFusedRows    = 8192;  // Nvfp4/Fp8GdnInputTp2ColumnGeometry::kOutputRows
+constexpr std::int32_t kShardQueryKeyRows = 2048;  // Q4G64_F16S query_key shard
+constexpr std::int32_t kShardValueZRows   = 6144;  // Q5G64_F16S value_z shard
+
+void validate_fused_column_rank_semantics(const Tensor& x, const Weight& w, const Tensor& qkv,
+                                          const Tensor& z, LinearPolicy policy) {
+    validate_policy(policy);
+    const std::int32_t cols = x.ne[1];
+    if (cols <= 0) {
+        throw std::invalid_argument("gdn_input_proj column-parallel: T must be positive");
+    }
+    require_matrix(x, kShardHidden, cols, "x");
+    require_matrix(qkv, kShardQkvRows, cols, "qkv");
+    require_matrix(z, kShardZRows, cols, "z");
+    require_single_parent_nonoverlap(x, qkv, z);
+
+    if (w.qtype == QType::NVFP4) {
+        if (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA4) {
+            throw std::invalid_argument(
+                "gdn_input_proj column-parallel: NVFP4 admits only A16 or A4");
+        }
+        detail::validate_nvfp4_weight(w, "nvfp4 gdn_input_proj column-parallel");
+    } else if (w.qtype == QType::FP8_E4M3FN_ROW_BF16S) {
+        if (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA8) {
+            throw std::invalid_argument(
+                "gdn_input_proj column-parallel: FP8 admits only A16 or A8");
+        }
+        detail::validate_fp8_weight(w, "fp8 gdn_input_proj column-parallel");
+    } else {
+        throw std::invalid_argument(
+            "gdn_input_proj column-parallel: unsupported fused weight format");
+    }
+    if (w.n != kShardFusedRows || w.k != kShardHidden) {
+        throw std::invalid_argument(
+            "gdn_input_proj column-parallel: unsupported weight shard shape");
+    }
+}
+
+// Cross-rank agreement only a pair can check; every per-rank invariant is validated separately by
+// validate_fused_column_rank_semantics. Mirrors attn_input_proj's own validate_fused_split_pair
+// (src/ops/wrapper/attn_input_proj.cpp).
+void validate_fused_split_pair(const std::array<Tensor, 2>& x, const std::array<Weight, 2>& w,
+                               const ExecutionContext& ec) {
+    detail::require_split_context(
+        ec, "gdn_input_proj column-parallel: requires an ExecutionContext with two distinct "
+            "devices");
+    if (x[0].ne[1] != x[1].ne[1]) {
+        throw std::invalid_argument(
+            "gdn_input_proj column-parallel: both ranks must carry the same token count");
+    }
+    if (w[0].qtype != w[1].qtype || w[0].layout != w[1].layout) {
+        throw std::invalid_argument(
+            "gdn_input_proj column-parallel: both ranks must carry the same weight format");
+    }
+    if (w[0].k != w[1].k) {
+        throw std::invalid_argument(
+            "gdn_input_proj column-parallel: both ranks must consume the same input extent K");
+    }
+}
+
+void validate_split_storage_column_rank_semantics(const Tensor& x, const Weight& query_key_w,
+                                                   const Weight& value_z_w, const Tensor& qkv,
+                                                   const Tensor& z) {
+    const std::int32_t cols = x.ne[1];
+    if (cols <= 0) {
+        throw std::invalid_argument("gdn_input_proj column-parallel: T must be positive");
+    }
+    require_matrix(x, kShardHidden, cols, "x");
+    require_matrix(qkv, kShardQkvRows, cols, "qkv");
+    require_matrix(z, kShardZRows, cols, "z");
+    require_single_parent_nonoverlap(x, qkv, z);
+    require_rowsplit(query_key_w, QType::Q4G64_F16S, kShardQueryKeyRows, "query/key weight shard");
+    require_rowsplit(value_z_w, QType::Q5G64_F16S, kShardValueZRows, "value/z weight shard");
+}
+
+void validate_split_storage_split_pair(const std::array<Tensor, 2>& x,
+                                       const std::array<Weight, 2>& query_key_w,
+                                       const std::array<Weight, 2>& value_z_w,
+                                       const ExecutionContext& ec) {
+    detail::require_split_context(
+        ec, "gdn_input_proj column-parallel: requires an ExecutionContext with two distinct "
+            "devices");
+    if (x[0].ne[1] != x[1].ne[1]) {
+        throw std::invalid_argument(
+            "gdn_input_proj column-parallel: both ranks must carry the same token count");
+    }
+    if (query_key_w[0].qtype != query_key_w[1].qtype ||
+        value_z_w[0].qtype != value_z_w[1].qtype) {
+        throw std::invalid_argument(
+            "gdn_input_proj column-parallel: both ranks must carry the same weight format");
+    }
+    if (query_key_w[0].k != query_key_w[1].k || value_z_w[0].k != value_z_w[1].k) {
+        throw std::invalid_argument(
+            "gdn_input_proj column-parallel: both ranks must consume the same input extent K");
+    }
+}
+
+} // namespace
+
+std::size_t gdn_input_proj_column_parallel_workspace_capacity_bytes(QType qtype,
+                                                                     LinearPolicy policy,
+                                                                     std::int32_t min_tokens,
+                                                                     std::int32_t max_tokens) {
+    // The activation-quantize workspace (NVFP4 W4A4 / FP8 A8) is a pure function of (tokens, K),
+    // and K=5120 is unchanged by the shard (only the output row count N halves) -- the tp1 query is
+    // exact here, the same rule attn_input_proj's own shard follows.
+    if (qtype == QType::NVFP4) {
+        return detail::nvfp4_gdn_input_workspace_capacity_bytes(policy, min_tokens, max_tokens);
+    }
+    if (qtype == QType::FP8_E4M3FN_ROW_BF16S) {
+        return detail::fp8_gdn_input_workspace_capacity_bytes(policy, min_tokens, max_tokens);
+    }
+    throw std::invalid_argument(
+        "gdn_input_proj column-parallel workspace: unsupported weight format");
+}
+
+void gdn_input_proj_column_parallel(const std::array<Tensor, 2>& x,
+                                    const std::array<Weight, 2>& query_key_value_z_weight,
+                                    const std::array<Tensor, 2>& qkv, const std::array<Tensor, 2>& z,
+                                    LinearPolicy policy,
+                                    const std::array<WorkspaceArena*, 2>& workspace,
+                                    const ExecutionContext& ec) {
+    validate_fused_split_pair(x, query_key_value_z_weight, ec);
+    // Validate both ranks before issuing either, so a rejected pair enqueues nothing.
+    for (std::size_t slot = 0; slot < 2; ++slot) {
+        validate_fused_column_rank_semantics(x[slot], query_key_value_z_weight[slot], qkv[slot],
+                                             z[slot], policy);
+    }
+    for (int rank = 0; rank < 2; ++rank) {
+        const auto slot = static_cast<std::size_t>(rank);
+        detail::require_rank_residency(
+            ec, rank, x[slot].data, query_key_value_z_weight[slot].payload, qkv[slot].data,
+            "gdn_input_proj column-parallel: every per-rank argument must be resident on "
+            "ec.dev[rank]");
+    }
+    std::array<Tensor, 2> qkv_dst{qkv[0], qkv[1]};
+    std::array<Tensor, 2> z_dst{z[0], z[1]};
+    detail::for_each_rank(ec, [&](int rank) {
+        const auto slot = static_cast<std::size_t>(rank);
+        const Weight& w = query_key_value_z_weight[slot];
+        if (w.qtype == QType::NVFP4) {
+            detail::nvfp4_gdn_input_dispatch_shard(x[slot], w, qkv_dst[slot], z_dst[slot], policy,
+                                                   workspace[slot], ec.dev[slot]->stream);
+        } else {
+            detail::fp8_gdn_input_dispatch_shard(x[slot], w, qkv_dst[slot], z_dst[slot], policy,
+                                                 workspace[slot], ec.dev[slot]->stream);
+        }
+    });
+}
+
+void gdn_input_proj_column_parallel(const std::array<Tensor, 2>& x,
+                                    const std::array<Weight, 2>& query_key_value_z_weight,
+                                    const std::array<Tensor, 2>& qkv, const std::array<Tensor, 2>& z,
+                                    const ExecutionContext& ec) {
+    gdn_input_proj_column_parallel(x, query_key_value_z_weight, qkv, z, LinearPolicy::A16Only,
+                                   {nullptr, nullptr}, ec);
+}
+
+void gdn_input_proj_column_parallel(const std::array<Tensor, 2>& x,
+                                    const std::array<Weight, 2>& query_key_weight,
+                                    const std::array<Weight, 2>& value_z_weight,
+                                    const std::array<Tensor, 2>& qkv, const std::array<Tensor, 2>& z,
+                                    const ExecutionContext& ec) {
+    validate_split_storage_split_pair(x, query_key_weight, value_z_weight, ec);
+    for (std::size_t slot = 0; slot < 2; ++slot) {
+        validate_split_storage_column_rank_semantics(x[slot], query_key_weight[slot],
+                                                      value_z_weight[slot], qkv[slot], z[slot]);
+    }
+    for (int rank = 0; rank < 2; ++rank) {
+        const auto slot = static_cast<std::size_t>(rank);
+        detail::require_rank_residency(
+            ec, rank, x[slot].data, query_key_weight[slot].payload, qkv[slot].data,
+            "gdn_input_proj column-parallel: every per-rank argument must be resident on "
+            "ec.dev[rank]");
+        detail::require_rank_residency(
+            ec, rank, x[slot].data, value_z_weight[slot].payload, z[slot].data,
+            "gdn_input_proj column-parallel: every per-rank argument must be resident on "
+            "ec.dev[rank]");
+    }
+    std::array<Tensor, 2> qkv_dst{qkv[0], qkv[1]};
+    std::array<Tensor, 2> z_dst{z[0], z[1]};
+    detail::for_each_rank(ec, [&](int rank) {
+        const auto slot = static_cast<std::size_t>(rank);
+        detail::q4_q5_gdn_input_dispatch(x[slot], query_key_weight[slot], value_z_weight[slot],
+                                         qkv_dst[slot], z_dst[slot], ec.dev[slot]->stream);
+    });
+}
+
+// --- Tensor-parallel conv_snapshot / conv_record (tp == 2) ---------------------------------------
+// See include/ninfer/ops/gdn_input_proj.h for the full design note (geometry, why the shard always
+// takes the composed route, and which formats are registered).
+namespace {
+
+constexpr std::int32_t kShardQueryRows   = 1024; // 8 of 16 key heads x 128
+constexpr std::int32_t kShardKeyRows     = 1024;
+constexpr std::int32_t kShardValueRows   = 3072; // 24 of 48 value heads x 128
+constexpr std::int32_t kShardConvChannels =
+    kShardQueryRows + kShardKeyRows + kShardValueRows; // == kShardQkvRows (5120)
+static_assert(kShardConvChannels == kShardQkvRows);
+
+void require_conv_split_pair(const std::array<Tensor, 2>& x, const ExecutionContext& ec,
+                             const char* op) {
+    const std::string message =
+        std::string(op) + ": requires an ExecutionContext with two distinct devices";
+    detail::require_split_context(ec, message.c_str());
+    if (x[0].ne[1] != x[1].ne[1] || x[0].ne[2] != x[1].ne[2]) {
+        throw std::invalid_argument(std::string(op) +
+                                    ": both ranks must carry the same width and batch");
+    }
+}
+
+void require_conv_shard_workspace(const std::array<WorkspaceArena*, 2>& workspace, const char* op) {
+    if (workspace[0] == nullptr || workspace[1] == nullptr) {
+        throw std::invalid_argument(std::string(op) +
+                                    ": the composed shard route requires a caller workspace on "
+                                    "every rank");
+    }
+}
+
+// Per-rank shard validation shared by both Ops' fused and split-storage forms. Returns the
+// convolution geometry so the caller does not re-derive it.
+ConvGeometry validate_snapshot_shard_rank(const Tensor& x, const Tensor& conv_weight,
+                                          const Tensor& conv_states, const Tensor& valid_columns,
+                                          const Tensor& initial_state_slots,
+                                          const Tensor& snapshot_base_slots, const Tensor& query,
+                                          const Tensor& key, const Tensor& value, const Tensor& z) {
+    constexpr const char* kOp   = "gdn_input_proj_conv_snapshot";
+    const ConvGeometry geometry = require_snapshot_input(x, kShardHidden);
+    require_snapshot_operands(conv_weight, conv_states, valid_columns, initial_state_slots,
+                              snapshot_base_slots, kShardConvChannels, geometry);
+    require_conv_tensor(query, kShardQueryRows, geometry.width, geometry.batch, kOp, "query");
+    require_conv_tensor(key, kShardKeyRows, geometry.width, geometry.batch, kOp, "key");
+    require_conv_tensor(value, kShardValueRows, geometry.width, geometry.batch, kOp, "value");
+    require_conv_tensor(z, kShardZRows, geometry.width, geometry.batch, kOp, "z");
+    return geometry;
+}
+
+ConvGeometry validate_record_shard_rank(const Tensor& x, const Tensor& conv_weight,
+                                        const Tensor& conv_states, const Tensor& valid_columns,
+                                        const Tensor& initial_state_slots,
+                                        const Tensor& conv_record, const Tensor& query,
+                                        const Tensor& key, const Tensor& value, const Tensor& z) {
+    constexpr const char* kOp   = "gdn_input_proj_conv_record";
+    const ConvGeometry geometry = require_record_input(x, kShardHidden);
+    require_record_operands(conv_weight, conv_states, valid_columns, initial_state_slots,
+                            kShardConvChannels, geometry);
+    require_conv_tensor(conv_record, kShardConvChannels, geometry.width, geometry.batch, kOp,
+                        "conv record");
+    require_conv_tensor(query, kShardQueryRows, geometry.width, geometry.batch, kOp, "query");
+    require_conv_tensor(key, kShardKeyRows, geometry.width, geometry.batch, kOp, "key");
+    require_conv_tensor(value, kShardValueRows, geometry.width, geometry.batch, kOp, "value");
+    require_conv_tensor(z, kShardZRows, geometry.width, geometry.batch, kOp, "z");
+    return geometry;
+}
+
+void validate_fused_shard_weight(const Weight& w, LinearPolicy policy, const char* op) {
+    validate_policy(policy);
+    if (w.qtype == QType::NVFP4) {
+        if (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA4) {
+            throw std::invalid_argument(std::string(op) + ": NVFP4 admits only A16 or A4");
+        }
+        detail::validate_nvfp4_weight(w, op);
+    } else if (w.qtype == QType::FP8_E4M3FN_ROW_BF16S) {
+        if (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA8) {
+            throw std::invalid_argument(std::string(op) + ": FP8 admits only A16 or A8");
+        }
+        detail::validate_fp8_weight(w, op);
+    } else {
+        throw std::invalid_argument(std::string(op) + ": unsupported fused weight format");
+    }
+    if (w.n != kShardFusedRows || w.k != kShardHidden) {
+        throw std::invalid_argument(std::string(op) + ": unsupported weight shard shape");
+    }
+}
+
+std::size_t shard_projection_workspace_bytes(QType qtype, LinearPolicy policy,
+                                             std::int32_t min_columns, std::int32_t max_columns,
+                                             const char* op) {
+    // K = 5120 is unchanged by the shard (only the output row count halves), so the tp1 activation
+    // quantization query is exact -- the same argument
+    // gdn_input_proj_column_parallel_workspace_capacity_bytes makes.
+    if (qtype == QType::NVFP4) {
+        return detail::nvfp4_gdn_input_workspace_capacity_bytes(policy, min_columns, max_columns);
+    }
+    if (qtype == QType::FP8_E4M3FN_ROW_BF16S) {
+        return detail::fp8_gdn_input_workspace_capacity_bytes(policy, min_columns, max_columns);
+    }
+    if (qtype == QType::Q4G64_F16S || qtype == QType::Q5G64_F16S) {
+        return 0; // the Q4/Q5 grouped-MMA route allocates no transient storage.
+    }
+    throw std::invalid_argument(std::string(op) + ": unsupported weight format");
+}
+
+void require_conv_shard_domain(std::int32_t batch_size, std::int32_t min_width,
+                               std::int32_t max_width, std::int32_t minimum_width, const char* op) {
+    constexpr std::int32_t kMaximumBatch = 8;
+    constexpr std::int32_t kMaximumWidth = 16;
+    if (batch_size <= 0 || batch_size > kMaximumBatch || min_width < minimum_width ||
+        min_width > max_width || (batch_size > 1 && max_width > kMaximumWidth) ||
+        (minimum_width > 1 && max_width > kMaximumWidth)) {
+        throw std::invalid_argument(std::string(op) + " workspace: invalid B/W domain");
+    }
+}
+
+// Projects one rank's shard into `destination` [5120, B*W] and writes its z half.
+template <class Project>
+void compose_shard_conv(const Tensor& x, Tensor& destination, Tensor& z, ConvGeometry geometry,
+                        Project&& project) {
+    Tensor x_flat = flatten_columns(x, kShardHidden, geometry);
+    Tensor z_flat = flatten_columns(z, kShardZRows, geometry);
+    project(x_flat, destination, z_flat);
+}
+
+} // namespace
+
+std::size_t gdn_input_proj_conv_snapshot_column_parallel_workspace_capacity_bytes(
+    QType qtype, LinearPolicy policy, std::int32_t batch_size, std::int32_t min_width,
+    std::int32_t max_width) {
+    constexpr const char* kOp = "gdn_input_proj_conv_snapshot column-parallel";
+    require_conv_shard_domain(batch_size, min_width, max_width, 1, kOp);
+    const std::int32_t columns = batch_size * max_width;
+    return composed_snapshot_capacity(
+        kShardConvChannels, columns,
+        shard_projection_workspace_bytes(qtype, policy, batch_size * min_width, columns, kOp));
+}
+
+std::size_t gdn_input_proj_conv_record_column_parallel_workspace_capacity_bytes(
+    QType qtype, LinearPolicy policy, std::int32_t batch_size, std::int32_t min_width,
+    std::int32_t max_width) {
+    constexpr const char* kOp = "gdn_input_proj_conv_record column-parallel";
+    require_conv_shard_domain(batch_size, min_width, max_width, 2, kOp);
+    // conv_record is caller-owned, so the composed record route needs no projected plane -- only
+    // whatever activation-quantization storage the projection route itself selects.
+    return shard_projection_workspace_bytes(qtype, policy, batch_size * min_width,
+                                            batch_size * max_width, kOp);
+}
+
+void gdn_input_proj_conv_snapshot_column_parallel(
+    const std::array<Tensor, 2>& x, const std::array<Weight, 2>& query_key_value_z_weight,
+    const std::array<Tensor, 2>& conv_weight, const std::array<Tensor, 2>& conv_states,
+    const std::array<Tensor, 2>& valid_columns, const std::array<Tensor, 2>& initial_state_slots,
+    const std::array<Tensor, 2>& snapshot_base_slots, const std::array<Tensor, 2>& query,
+    const std::array<Tensor, 2>& key, const std::array<Tensor, 2>& value,
+    const std::array<Tensor, 2>& z, LinearPolicy policy,
+    const std::array<WorkspaceArena*, 2>& workspace, const ExecutionContext& ec) {
+    constexpr const char* kOp = "gdn_input_proj_conv_snapshot column-parallel";
+    require_conv_split_pair(x, ec, kOp);
+    require_conv_shard_workspace(workspace, kOp);
+    std::array<ConvGeometry, 2> geometry{};
+    for (std::size_t slot = 0; slot < 2; ++slot) {
+        validate_fused_shard_weight(query_key_value_z_weight[slot], policy, kOp);
+        geometry[slot] = validate_snapshot_shard_rank(
+            x[slot], conv_weight[slot], conv_states[slot], valid_columns[slot],
+            initial_state_slots[slot], snapshot_base_slots[slot], query[slot], key[slot],
+            value[slot], z[slot]);
+    }
+    if (query_key_value_z_weight[0].qtype != query_key_value_z_weight[1].qtype) {
+        throw std::invalid_argument(std::string(kOp) +
+                                    ": both ranks must carry the same weight format");
+    }
+    for (int rank = 0; rank < 2; ++rank) {
+        const auto slot = static_cast<std::size_t>(rank);
+        detail::require_rank_residency(
+            ec, rank, x[slot].data, query_key_value_z_weight[slot].payload, conv_states[slot].data,
+            "gdn_input_proj_conv_snapshot column-parallel: every per-rank argument must be "
+            "resident on ec.dev[rank]");
+    }
+
+    std::array<Tensor, 2> states{conv_states[0], conv_states[1]};
+    std::array<Tensor, 2> q_dst{query[0], query[1]};
+    std::array<Tensor, 2> k_dst{key[0], key[1]};
+    std::array<Tensor, 2> v_dst{value[0], value[1]};
+    std::array<Tensor, 2> z_dst{z[0], z[1]};
+    detail::for_each_rank(ec, [&](int rank) {
+        const auto slot        = static_cast<std::size_t>(rank);
+        const Weight& w        = query_key_value_z_weight[slot];
+        cudaStream_t stream    = ec.dev[slot]->stream;
+        WorkspaceArena& arena  = *workspace[slot];
+        auto scope             = arena.scope();
+        Tensor projected =
+            arena.alloc(DType::BF16, {kShardConvChannels, geometry[slot].aggregate_columns});
+        compose_shard_conv(x[slot], projected, z_dst[slot], geometry[slot],
+                           [&](const Tensor& x_flat, Tensor& out, Tensor& z_flat) {
+                               if (w.qtype == QType::NVFP4) {
+                                   detail::nvfp4_gdn_input_dispatch_shard(x_flat, w, out, z_flat,
+                                                                          policy, &arena, stream);
+                               } else {
+                                   detail::fp8_gdn_input_dispatch_shard(x_flat, w, out, z_flat,
+                                                                        policy, &arena, stream);
+                               }
+                           });
+        Tensor projected_3d(projected.data, DType::BF16,
+                            {kShardConvChannels, geometry[slot].width, geometry[slot].batch});
+        detail::gdn_projected_conv_snapshot_launch(
+            projected_3d, conv_weight[slot], states[slot], valid_columns[slot],
+            initial_state_slots[slot], snapshot_base_slots[slot], q_dst[slot], k_dst[slot],
+            v_dst[slot], stream);
+    });
+}
+
+void gdn_input_proj_conv_snapshot_column_parallel(
+    const std::array<Tensor, 2>& x, const std::array<Weight, 2>& query_key_weight,
+    const std::array<Weight, 2>& value_z_weight, const std::array<Tensor, 2>& conv_weight,
+    const std::array<Tensor, 2>& conv_states, const std::array<Tensor, 2>& valid_columns,
+    const std::array<Tensor, 2>& initial_state_slots,
+    const std::array<Tensor, 2>& snapshot_base_slots, const std::array<Tensor, 2>& query,
+    const std::array<Tensor, 2>& key, const std::array<Tensor, 2>& value,
+    const std::array<Tensor, 2>& z, const std::array<WorkspaceArena*, 2>& workspace,
+    const ExecutionContext& ec) {
+    constexpr const char* kOp = "gdn_input_proj_conv_snapshot column-parallel";
+    require_conv_split_pair(x, ec, kOp);
+    require_conv_shard_workspace(workspace, kOp);
+    std::array<ConvGeometry, 2> geometry{};
+    for (std::size_t slot = 0; slot < 2; ++slot) {
+        require_rowsplit(query_key_weight[slot], QType::Q4G64_F16S, kShardQueryKeyRows,
+                         "query/key weight shard");
+        require_rowsplit(value_z_weight[slot], QType::Q5G64_F16S, kShardValueZRows,
+                         "value/z weight shard");
+        geometry[slot] = validate_snapshot_shard_rank(
+            x[slot], conv_weight[slot], conv_states[slot], valid_columns[slot],
+            initial_state_slots[slot], snapshot_base_slots[slot], query[slot], key[slot],
+            value[slot], z[slot]);
+    }
+    for (int rank = 0; rank < 2; ++rank) {
+        const auto slot = static_cast<std::size_t>(rank);
+        detail::require_rank_residency(
+            ec, rank, x[slot].data, query_key_weight[slot].payload, conv_states[slot].data,
+            "gdn_input_proj_conv_snapshot column-parallel: every per-rank argument must be "
+            "resident on ec.dev[rank]");
+    }
+
+    std::array<Tensor, 2> states{conv_states[0], conv_states[1]};
+    std::array<Tensor, 2> q_dst{query[0], query[1]};
+    std::array<Tensor, 2> k_dst{key[0], key[1]};
+    std::array<Tensor, 2> v_dst{value[0], value[1]};
+    std::array<Tensor, 2> z_dst{z[0], z[1]};
+    detail::for_each_rank(ec, [&](int rank) {
+        const auto slot       = static_cast<std::size_t>(rank);
+        cudaStream_t stream   = ec.dev[slot]->stream;
+        WorkspaceArena& arena = *workspace[slot];
+        auto scope            = arena.scope();
+        Tensor projected =
+            arena.alloc(DType::BF16, {kShardConvChannels, geometry[slot].aggregate_columns});
+        compose_shard_conv(x[slot], projected, z_dst[slot], geometry[slot],
+                           [&](const Tensor& x_flat, Tensor& out, Tensor& z_flat) {
+                               detail::q4_q5_gdn_input_dispatch(x_flat, query_key_weight[slot],
+                                                                value_z_weight[slot], out, z_flat,
+                                                                stream);
+                           });
+        Tensor projected_3d(projected.data, DType::BF16,
+                            {kShardConvChannels, geometry[slot].width, geometry[slot].batch});
+        detail::gdn_projected_conv_snapshot_launch(
+            projected_3d, conv_weight[slot], states[slot], valid_columns[slot],
+            initial_state_slots[slot], snapshot_base_slots[slot], q_dst[slot], k_dst[slot],
+            v_dst[slot], stream);
+    });
+}
+
+void gdn_input_proj_conv_record_column_parallel(
+    const std::array<Tensor, 2>& x, const std::array<Weight, 2>& query_key_value_z_weight,
+    const std::array<Tensor, 2>& conv_weight, const std::array<Tensor, 2>& conv_states,
+    const std::array<Tensor, 2>& valid_columns, const std::array<Tensor, 2>& initial_state_slots,
+    const std::array<Tensor, 2>& conv_record, const std::array<Tensor, 2>& query,
+    const std::array<Tensor, 2>& key, const std::array<Tensor, 2>& value,
+    const std::array<Tensor, 2>& z, LinearPolicy policy,
+    const std::array<WorkspaceArena*, 2>& workspace, const ExecutionContext& ec) {
+    constexpr const char* kOp = "gdn_input_proj_conv_record column-parallel";
+    require_conv_split_pair(x, ec, kOp);
+    require_conv_shard_workspace(workspace, kOp);
+    std::array<ConvGeometry, 2> geometry{};
+    for (std::size_t slot = 0; slot < 2; ++slot) {
+        validate_fused_shard_weight(query_key_value_z_weight[slot], policy, kOp);
+        geometry[slot] = validate_record_shard_rank(
+            x[slot], conv_weight[slot], conv_states[slot], valid_columns[slot],
+            initial_state_slots[slot], conv_record[slot], query[slot], key[slot], value[slot],
+            z[slot]);
+    }
+    if (query_key_value_z_weight[0].qtype != query_key_value_z_weight[1].qtype) {
+        throw std::invalid_argument(std::string(kOp) +
+                                    ": both ranks must carry the same weight format");
+    }
+    for (int rank = 0; rank < 2; ++rank) {
+        const auto slot = static_cast<std::size_t>(rank);
+        detail::require_rank_residency(
+            ec, rank, x[slot].data, query_key_value_z_weight[slot].payload, conv_record[slot].data,
+            "gdn_input_proj_conv_record column-parallel: every per-rank argument must be resident "
+            "on ec.dev[rank]");
+    }
+
+    std::array<Tensor, 2> record_dst{conv_record[0], conv_record[1]};
+    std::array<Tensor, 2> q_dst{query[0], query[1]};
+    std::array<Tensor, 2> k_dst{key[0], key[1]};
+    std::array<Tensor, 2> v_dst{value[0], value[1]};
+    std::array<Tensor, 2> z_dst{z[0], z[1]};
+    detail::for_each_rank(ec, [&](int rank) {
+        const auto slot       = static_cast<std::size_t>(rank);
+        const Weight& w       = query_key_value_z_weight[slot];
+        cudaStream_t stream   = ec.dev[slot]->stream;
+        WorkspaceArena& arena = *workspace[slot];
+        auto scope            = arena.scope();
+        Tensor record_flat = flatten_columns(record_dst[slot], kShardConvChannels, geometry[slot]);
+        compose_shard_conv(x[slot], record_flat, z_dst[slot], geometry[slot],
+                           [&](const Tensor& x_flat, Tensor& out, Tensor& z_flat) {
+                               if (w.qtype == QType::NVFP4) {
+                                   detail::nvfp4_gdn_input_dispatch_shard(x_flat, w, out, z_flat,
+                                                                          policy, &arena, stream);
+                               } else {
+                                   detail::fp8_gdn_input_dispatch_shard(x_flat, w, out, z_flat,
+                                                                        policy, &arena, stream);
+                               }
+                           });
+        detail::gdn_projected_conv_record_launch(record_dst[slot], conv_weight[slot],
+                                                 conv_states[slot], valid_columns[slot],
+                                                 initial_state_slots[slot], q_dst[slot], k_dst[slot],
+                                                 v_dst[slot], stream);
+    });
+}
+
+void gdn_input_proj_conv_record_column_parallel(
+    const std::array<Tensor, 2>& x, const std::array<Weight, 2>& query_key_weight,
+    const std::array<Weight, 2>& value_z_weight, const std::array<Tensor, 2>& conv_weight,
+    const std::array<Tensor, 2>& conv_states, const std::array<Tensor, 2>& valid_columns,
+    const std::array<Tensor, 2>& initial_state_slots, const std::array<Tensor, 2>& conv_record,
+    const std::array<Tensor, 2>& query, const std::array<Tensor, 2>& key,
+    const std::array<Tensor, 2>& value, const std::array<Tensor, 2>& z,
+    const std::array<WorkspaceArena*, 2>& workspace, const ExecutionContext& ec) {
+    constexpr const char* kOp = "gdn_input_proj_conv_record column-parallel";
+    require_conv_split_pair(x, ec, kOp);
+    require_conv_shard_workspace(workspace, kOp);
+    std::array<ConvGeometry, 2> geometry{};
+    for (std::size_t slot = 0; slot < 2; ++slot) {
+        require_rowsplit(query_key_weight[slot], QType::Q4G64_F16S, kShardQueryKeyRows,
+                         "query/key weight shard");
+        require_rowsplit(value_z_weight[slot], QType::Q5G64_F16S, kShardValueZRows,
+                         "value/z weight shard");
+        geometry[slot] = validate_record_shard_rank(
+            x[slot], conv_weight[slot], conv_states[slot], valid_columns[slot],
+            initial_state_slots[slot], conv_record[slot], query[slot], key[slot], value[slot],
+            z[slot]);
+    }
+    for (int rank = 0; rank < 2; ++rank) {
+        const auto slot = static_cast<std::size_t>(rank);
+        detail::require_rank_residency(
+            ec, rank, x[slot].data, query_key_weight[slot].payload, conv_record[slot].data,
+            "gdn_input_proj_conv_record column-parallel: every per-rank argument must be resident "
+            "on ec.dev[rank]");
+    }
+
+    std::array<Tensor, 2> record_dst{conv_record[0], conv_record[1]};
+    std::array<Tensor, 2> q_dst{query[0], query[1]};
+    std::array<Tensor, 2> k_dst{key[0], key[1]};
+    std::array<Tensor, 2> v_dst{value[0], value[1]};
+    std::array<Tensor, 2> z_dst{z[0], z[1]};
+    detail::for_each_rank(ec, [&](int rank) {
+        const auto slot     = static_cast<std::size_t>(rank);
+        cudaStream_t stream = ec.dev[slot]->stream;
+        Tensor record_flat = flatten_columns(record_dst[slot], kShardConvChannels, geometry[slot]);
+        compose_shard_conv(x[slot], record_flat, z_dst[slot], geometry[slot],
+                           [&](const Tensor& x_flat, Tensor& out, Tensor& z_flat) {
+                               detail::q4_q5_gdn_input_dispatch(x_flat, query_key_weight[slot],
+                                                                value_z_weight[slot], out, z_flat,
+                                                                stream);
+                           });
+        detail::gdn_projected_conv_record_launch(record_dst[slot], conv_weight[slot],
+                                                 conv_states[slot], valid_columns[slot],
+                                                 initial_state_slots[slot], q_dst[slot], k_dst[slot],
+                                                 v_dst[slot], stream);
+    });
 }
 
 } // namespace ninfer::ops

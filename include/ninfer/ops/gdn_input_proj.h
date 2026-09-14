@@ -4,10 +4,12 @@
 
 #include "core/arena.h"
 #include "core/tensor.h"
+#include "ninfer/ops/allreduce.h" // ExecutionContext (tp2 split form)
 #include "ninfer/ops/linear.h"
 
 #include <cuda_runtime.h>
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 
@@ -235,5 +237,150 @@ void gdn_input_proj_conv_record(const Tensor& x, const Weight& query_key_value_z
                                 const Tensor& valid_columns, const Tensor& initial_state_slots,
                                 Tensor& conv_record, Tensor& query, Tensor& key, Tensor& value,
                                 Tensor& z, WorkspaceArena& workspace, cudaStream_t stream);
+
+// --- Tensor-parallel split form (tp == 2) -------------------------------------------------------
+//
+// DESIGN NOTE. ShardPlan's real interior layout for `gdn/query_key_value_z`
+// (src/targets/qwen3_6_27b/impl/load/bindings.cpp, `plan_for`'s "gdn/query_key_value_z" branch) is
+// FOUR independent append_column_block calls in Q | K | V | Z order:
+//
+//   Q [0, key_dim=2048) | K [2048, 4096) | V [4096, 10240) | Z [10240, 16384)
+//
+// (key_dim = gdn_key_heads(16) * gdn_key_head_dim(128); value_dim = gdn_value_heads(48) *
+// gdn_value_head_dim(128) = 6144 -- see src/targets/qwen3_6_27b/impl/config.h). At tp=2, device r's
+// shard is the concatenation, in that same Q|K|V|Z order, of rank r's own half of every section
+// (the same derivation attn_input_proj.h states for its own Q|K|Gate|V object):
+//
+//   shard-local Q [0,1024) | K [1024,2048) | V [2048,5120) | Z [5120,8192)
+//
+// (Q/K: 8 of the 16 key heads/device, 128 dim each; V/Z: 24 of the 48 value heads/device). This
+// matches Nvfp4GdnInputTp2ColumnGeometry (<8192,5120>, src/ops/linear/nvfp4/nvfp4_config.h)
+// exactly.
+//
+// OUTPUT CONTRACT: mirrors the tp1 Op's own 2-tensor packing (qkv + z), Geometry-halved -- NOT
+// four separate q/k/v/z tensors. Each device's call writes qkv[5120,T] (this device's Q|K|V,
+// shard-local row ranges [0,1024) | [1024,2048) | [2048,5120)) and z[3072,T] (this device's V-head-
+// aligned Z, rows [0,3072)). The GDN core reads a global head index by adding
+// `device_rank * 8` (Q/K) or `device_rank * 24` (V/Z) to the shard-local row's head number
+// (row / 128), the same convention attn_input_proj states for its own output. No cross-device
+// traffic occurs before or during this Op -- gdn_input_proj is column-parallel only, no allreduce.
+//
+// FORMATS REGISTERED: NVFP4 (A16Only/AllowA4, Nvfp4GdnInputTp2ColumnGeometry, shared with
+// ops::linear's own registry in src/ops/linear/nvfp4/nvfp4_config.h), FP8_E4M3FN_ROW_BF16S
+// (A16Only/AllowA8, Fp8GdnInputTp2ColumnGeometry in src/ops/linear/fp8/fp8_config.h -- the
+// Qwen38Nvfp4 profile's flagship binding for this object per bind_qwen38_nvfp4_text_layers) and
+// the Q4G64_F16S/Q5G64_F16S split-storage two-weight form (the groupwise profile's binding).
+// BF16_CTRL and W8G32_F16S are NOT registered -- neither is bound for this object by any
+// qwen3_8_27b weights profile (see bindings.cpp), the same exclusion attn_input_proj makes for
+// its sibling family.
+
+[[nodiscard]] std::size_t gdn_input_proj_column_parallel_workspace_capacity_bytes(
+    QType qtype, LinearPolicy policy, std::int32_t min_tokens, std::int32_t max_tokens);
+
+void gdn_input_proj_column_parallel(const std::array<Tensor, 2>& x,
+                                    const std::array<Weight, 2>& query_key_value_z_weight,
+                                    const std::array<Tensor, 2>& qkv, const std::array<Tensor, 2>& z,
+                                    LinearPolicy policy,
+                                    const std::array<WorkspaceArena*, 2>& workspace,
+                                    const ExecutionContext& ec);
+
+/** A16-only convenience overload, no policy/workspace. */
+void gdn_input_proj_column_parallel(const std::array<Tensor, 2>& x,
+                                    const std::array<Weight, 2>& query_key_value_z_weight,
+                                    const std::array<Tensor, 2>& qkv, const std::array<Tensor, 2>& z,
+                                    const ExecutionContext& ec);
+
+/** Q4G64_F16S/Q5G64_F16S split-storage two-weight form. */
+void gdn_input_proj_column_parallel(const std::array<Tensor, 2>& x,
+                                    const std::array<Weight, 2>& query_key_weight,
+                                    const std::array<Weight, 2>& value_z_weight,
+                                    const std::array<Tensor, 2>& qkv, const std::array<Tensor, 2>& z,
+                                    const ExecutionContext& ec);
+
+// --- Tensor-parallel split forms of the fused projection+conv1d+SiLU pair (tp == 2) -------------
+//
+// DESIGN NOTE. These two Ops are reached only from Phase::Verify (the MTP / speculative-verify
+// path), so their split is the composition of the bare projection's column shard (above) with the
+// GDN convolution's channel shard, rather than anything either of those owns on its own.
+//
+// GEOMETRY. Device r owns 8 of the 16 GDN key heads and 24 of the 48 GDN value heads, so its
+// projection shard is [8192,5120] (Nvfp4/Fp8GdnInputTp2ColumnGeometry, above) and its
+// convolution owns 5120 of the 10240 depthwise channels:
+//
+//   shard-local Q [0,1024) | K [1024,2048) | V [2048,5120)     (conv channels; 5120 total)
+//   shard-local Z [0,3072)                                     (bypasses the convolution)
+//
+// This is byte-for-byte the channel set `gdn/convolution`'s three-block ShardPlan gives device r
+// (bindings.cpp's `gdn/convolution` branch: channels [1024r,+1024) u [2048+1024r,+1024) u
+// [4096+3072r,+3072)) and the packing `gdn_input_proj_column_parallel` already writes, so nothing
+// repacks between the projection and the convolution.
+// Per-device operand shapes: x [5120,W,B], conv_weight [5120,4], conv_states [5120,3,Slots],
+// query/key [1024,W,B], value [3072,W,B], z [3072,W,B], conv_record [5120,T,B].
+//
+// NO COLLECTIVE. The convolution is depthwise and the projection is column-parallel, so a device's
+// 5120 channels never mix with the peer's. Both Ops are entirely local; the GDN block's one and
+// only all-reduce is the row-parallel `gdn/output` projection at the very end.
+//
+// ROUTE. The shard always takes the COMPOSED route (projection shard -> BF16 projected plane ->
+// the channel-generic projected-conv kernel), never a fused per-format snapshot kernel. The fused
+// NVFP4/FP8/W8 snapshot kernels bake the tp1 row profile into compile-time constants, and
+// instantiating a parallel exact set at the shard profile is kernel work, not the registry work
+// a shard geometry otherwise needs; the composed route is the same arithmetic in the same order at
+// one extra kernel launch and one BF16 staging round for query/key/value. This is the one route
+// fall-off the conv snapshot/record shards carry, and it is a performance item only: FP8 is
+// bit-exact against the tp1 reference at every case covered by ninfer_mtp_split_test, and NVFP4
+// is bit-exact wherever the tp1 path is also composed.
+//
+// FORMATS REGISTERED: NVFP4 (A16Only/AllowA4), FP8_E4M3FN_ROW_BF16S (A16Only/AllowA8) and the
+// Q4G64_F16S/Q5G64_F16S split-storage two-weight form -- exactly the three
+// `gdn_input_proj_column_parallel` registers. W8G32_F16S is NOT registered (it is the 35B-A3B
+// profile's [12288,2048] parent, which this target's ShardPlan never splits).
+
+[[nodiscard]] std::size_t gdn_input_proj_conv_snapshot_column_parallel_workspace_capacity_bytes(
+    QType qtype, LinearPolicy policy, std::int32_t batch_size, std::int32_t min_width,
+    std::int32_t max_width);
+
+[[nodiscard]] std::size_t gdn_input_proj_conv_record_column_parallel_workspace_capacity_bytes(
+    QType qtype, LinearPolicy policy, std::int32_t batch_size, std::int32_t min_width,
+    std::int32_t max_width);
+
+void gdn_input_proj_conv_snapshot_column_parallel(
+    const std::array<Tensor, 2>& x, const std::array<Weight, 2>& query_key_value_z_weight,
+    const std::array<Tensor, 2>& conv_weight, const std::array<Tensor, 2>& conv_states,
+    const std::array<Tensor, 2>& valid_columns, const std::array<Tensor, 2>& initial_state_slots,
+    const std::array<Tensor, 2>& snapshot_base_slots, const std::array<Tensor, 2>& query,
+    const std::array<Tensor, 2>& key, const std::array<Tensor, 2>& value,
+    const std::array<Tensor, 2>& z, LinearPolicy policy,
+    const std::array<WorkspaceArena*, 2>& workspace, const ExecutionContext& ec);
+
+/** Q4G64_F16S/Q5G64_F16S split-storage two-weight snapshot form (A16 only). */
+void gdn_input_proj_conv_snapshot_column_parallel(
+    const std::array<Tensor, 2>& x, const std::array<Weight, 2>& query_key_weight,
+    const std::array<Weight, 2>& value_z_weight, const std::array<Tensor, 2>& conv_weight,
+    const std::array<Tensor, 2>& conv_states, const std::array<Tensor, 2>& valid_columns,
+    const std::array<Tensor, 2>& initial_state_slots,
+    const std::array<Tensor, 2>& snapshot_base_slots, const std::array<Tensor, 2>& query,
+    const std::array<Tensor, 2>& key, const std::array<Tensor, 2>& value,
+    const std::array<Tensor, 2>& z, const std::array<WorkspaceArena*, 2>& workspace,
+    const ExecutionContext& ec);
+
+void gdn_input_proj_conv_record_column_parallel(
+    const std::array<Tensor, 2>& x, const std::array<Weight, 2>& query_key_value_z_weight,
+    const std::array<Tensor, 2>& conv_weight, const std::array<Tensor, 2>& conv_states,
+    const std::array<Tensor, 2>& valid_columns, const std::array<Tensor, 2>& initial_state_slots,
+    const std::array<Tensor, 2>& conv_record, const std::array<Tensor, 2>& query,
+    const std::array<Tensor, 2>& key, const std::array<Tensor, 2>& value,
+    const std::array<Tensor, 2>& z, LinearPolicy policy,
+    const std::array<WorkspaceArena*, 2>& workspace, const ExecutionContext& ec);
+
+/** Q4G64_F16S/Q5G64_F16S split-storage two-weight record form (A16 only). */
+void gdn_input_proj_conv_record_column_parallel(
+    const std::array<Tensor, 2>& x, const std::array<Weight, 2>& query_key_weight,
+    const std::array<Weight, 2>& value_z_weight, const std::array<Tensor, 2>& conv_weight,
+    const std::array<Tensor, 2>& conv_states, const std::array<Tensor, 2>& valid_columns,
+    const std::array<Tensor, 2>& initial_state_slots, const std::array<Tensor, 2>& conv_record,
+    const std::array<Tensor, 2>& query, const std::array<Tensor, 2>& key,
+    const std::array<Tensor, 2>& value, const std::array<Tensor, 2>& z,
+    const std::array<WorkspaceArena*, 2>& workspace, const ExecutionContext& ec);
 
 } // namespace ninfer::ops

@@ -70,4 +70,42 @@ void fp8_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor& o
     fp8_linear_swiglu_a8_launch(x, weight, out, workspace, stream);
 }
 
+// The tp2 column shard -- halved output rows (34816 -> 17408, kIntermediate 8704).
+namespace {
+
+void launch_a16_shard(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
+    constexpr std::int32_t kOutputRows = Fp8MlpGateUpTp2ColumnGeometry::kOutputRows / 2;
+    constexpr std::int32_t kChunk      = kFp8LinearSmallTMax<Fp8MlpGateUpTp2ColumnGeometry>;
+    for (std::int32_t token_begin = 0; token_begin < x.ne[1]; token_begin += kChunk) {
+        const std::int32_t active = std::min(kChunk, x.ne[1] - token_begin);
+        auto* input                = static_cast<std::uint8_t*>(x.data) +
+                      static_cast<std::int64_t>(token_begin) * weight.k * sizeof(std::uint16_t);
+        auto* output = static_cast<std::uint8_t*>(out.data) +
+                       static_cast<std::int64_t>(token_begin) * kOutputRows * sizeof(std::uint16_t);
+        Tensor input_chunk(input, DType::BF16, {weight.k, active});
+        Tensor output_chunk(output, DType::BF16, {kOutputRows, active});
+        if (active == 1) {
+            fp8_linear_swiglu_decode_launch_shard(input_chunk, weight, output_chunk, stream);
+        } else {
+            fp8_linear_swiglu_small_t_launch_shard(input_chunk, weight, output_chunk, stream);
+        }
+    }
+}
+
+} // namespace
+
+void fp8_linear_swiglu_dispatch_shard(const Tensor& x, const Weight& weight, Tensor& out,
+                                      LinearPolicy policy, WorkspaceArena* workspace,
+                                      cudaStream_t stream) {
+    if (resolve_route(policy, x.ne[1]) == Fp8LinearSwiGluRoute::A16) {
+        launch_a16_shard(x, weight, out, stream);
+        return;
+    }
+    if (workspace == nullptr) {
+        throw std::invalid_argument(
+            "fp8 A8 linear_swiglu column-parallel requires caller workspace");
+    }
+    fp8_linear_swiglu_a8_launch_shard(x, weight, out, *workspace, stream);
+}
+
 } // namespace ninfer::ops::detail

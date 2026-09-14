@@ -2,9 +2,11 @@
 
 #include "core/arena.h"
 #include "core/tensor.h"
+#include "ninfer/ops/allreduce.h" // ExecutionContext, PeerEvents (tp2 split forms)
 
 #include <cuda_runtime.h>
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 
@@ -117,5 +119,101 @@ void linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
  * @param[in] stream CUDA stream on which execution is enqueued.
  */
 void linear(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
+
+// --- Tensor-parallel split forms (tp == 2) ----------------------------------------------------
+//
+// Both forms are compositions of the single-device linear() above, not separate kernels: a shard
+// is a standalone `[N,K]` tensor of the same registered format with one axis narrowed -- exactly
+// what the tp2 loader materializes into each device's arena -- so the existing kernel run against
+// a shard weight already halves its grid along the split axis and already reads only that device's
+// bytes. The split forms add the per-rank device/stream discipline, the cross-rank shape
+// agreement a single device cannot check, and (row-parallel only) the summing collective.
+//
+// Every requirement of linear() applies per rank. `x[r]`, `w[r]`, `out[r]`, and `workspace[r]`
+// must be resident on `ec.dev[r]`, and rank r's work is enqueued on `ec.dev[r]->stream`. The
+// CALLER OBLIGATION of include/ninfer/ops/allreduce.h therefore applies here too: inputs staged
+// with the plain cudaMemcpy/cudaMemset/`<<<...>>>` forms land on a device's LEGACY DEFAULT stream,
+// which does not implicitly synchronize with `DeviceContext::stream`, and must be retired before
+// the call. Neither form synchronizes; on return the work is enqueued on both streams. The
+// caller's current CUDA device is preserved.
+//
+// The shard shapes must themselves be registered problems of the weight's format. The tp2 halves
+// of every registered non-vocabulary geometry are registered; an unregistered shard shape is
+// rejected exactly as an unregistered whole shape is.
+
+/**
+ * @brief Column-parallel (output-split) linear across two devices.
+ *
+ * Rank r computes `out[r] = w[r] * x[r]`, where `w[r]` is rank r's contiguous block of the logical
+ * weight's OUTPUT rows and `x[r]` holds the same replicated activation on both ranks. The two
+ * output blocks concatenate along `ne[0]` into the single-device result; nothing is communicated,
+ * so this form is exactly two independent `linear()` calls plus validation.
+ *
+ * `w[0].k` must equal `w[1].k` (both ranks consume the whole input), and both ranks must agree on
+ * the token count `x[r].ne[1]`. The per-rank output row counts `w[r].n` need not be equal: an
+ * uneven split is legal, and this Op never needs to know the logical total.
+ *
+ * @param[in] x Per-rank replicated BF16 activation `[K,T]`.
+ * @param[in] w Per-rank weight-row shard `[N_r,K]`.
+ * @param[out] out Per-rank BF16 output block `[N_r,T]`.
+ * @param[in] policy Permitted private activation-compute profiles, applied identically per rank.
+ * @param[in,out] workspace Per-rank caller-owned transient arena, or null when the resolved route
+ * needs none (see linear_workspace_capacity_bytes(), which is evaluated at the SHARD shape).
+ * @param[in] ec Execution context holding exactly two distinct devices.
+ */
+void linear_column_parallel(const std::array<Tensor, 2>& x, const std::array<Weight, 2>& w,
+                            const std::array<Tensor, 2>& out, LinearPolicy policy,
+                            const std::array<WorkspaceArena*, 2>& workspace,
+                            const ExecutionContext& ec);
+
+/// A16-only column-parallel form; requires no transient workspace.
+void linear_column_parallel(const std::array<Tensor, 2>& x, const std::array<Weight, 2>& w,
+                            const std::array<Tensor, 2>& out, const ExecutionContext& ec);
+
+/**
+ * @brief Row-parallel (input-split) linear across two devices, all-reduced.
+ *
+ * Rank r computes the FULL-width partial `out[r] = w[r] * x[r]`, where `w[r]` is rank r's block of
+ * the logical weight's INPUT columns and `x[r]` the matching block of the activation's rows. A
+ * single `allreduce_sum` over `out` then leaves the complete `[N,T]` result on both ranks:
+ *
+ * @f[
+ *   \mathrm{out}_{n,t} = \sum_{r} \sum_{k \in \mathrm{block}(r)}
+ *     \mathrm{FP32Dequant}(w)_{n,k}\,\mathrm{FP32}(x_{k,t}).
+ * @f]
+ *
+ * `w[0].n` must equal `w[1].n` (both ranks produce every output row) and both ranks must agree on
+ * the token count. `w[r].k` need not be equal across ranks. `staging[r]` is scratch of the output's
+ * dtype and shape resident on `ec.dev[r]`, must not overlap `out[r]`, and its contents after the
+ * call are unspecified; `events` must be live. Consecutive calls sharing the same buffers, staging,
+ * and events need no host synchronization between them.
+ *
+ * @par Numerical note
+ * The split reduction is NOT bit-identical to the single-device result and cannot be: each rank
+ * rounds its partial to BF16 storage before the collective adds them, so a split evaluation
+ * carries two extra roundings the whole-K accumulation does not. The observable difference is
+ * bounded by the partial magnitudes, not by the summed magnitude, which is why the split-parity
+ * criterion is stated against the largest output rather than per element.
+ *
+ * @param[in] x Per-rank activation block `[K_r,T]`.
+ * @param[in] w Per-rank weight-column shard `[N,K_r]`.
+ * @param[in,out] out Per-rank BF16 `[N,T]`; holds rank r's partial until the collective completes,
+ * then the identical summed result on both ranks.
+ * @param[in,out] staging Per-rank scratch matching `out`, disjoint from it.
+ * @param[in] policy Permitted private activation-compute profiles, applied identically per rank.
+ * @param[in,out] workspace Per-rank caller-owned transient arena, or null when the resolved route
+ * needs none. Sized at the SHARD shape.
+ * @param[in] ec Execution context holding exactly two distinct devices.
+ * @param[in] events Live cross-device ordering events, as for allreduce_sum().
+ */
+void linear_row_parallel(const std::array<Tensor, 2>& x, const std::array<Weight, 2>& w,
+                         const std::array<Tensor, 2>& out, const std::array<Tensor, 2>& staging,
+                         LinearPolicy policy, const std::array<WorkspaceArena*, 2>& workspace,
+                         const ExecutionContext& ec, const PeerEvents& events);
+
+/// A16-only row-parallel form; requires no transient workspace.
+void linear_row_parallel(const std::array<Tensor, 2>& x, const std::array<Weight, 2>& w,
+                         const std::array<Tensor, 2>& out, const std::array<Tensor, 2>& staging,
+                         const ExecutionContext& ec, const PeerEvents& events);
 
 } // namespace ninfer::ops

@@ -39,9 +39,13 @@ std::size_t q5_linear_add_capacity_workspace_bytes(std::int32_t rows, std::int32
                                                    std::int32_t padded_k, std::int32_t min_cols,
                                                    std::int32_t max_cols);
 
+// `ws` is accepted but never read: every Q5 linear_add route resolves to zero transient bytes
+// (q5_linear_add_capacity_workspace_bytes always returns 0), so the pointer is nullable and exists
+// only so the signature matches the other formats' dispatchers -- see nvfp4_linear_add_dispatch for
+// the format that actually needs one.
 void q5_linear_add_execute_plan(const Q5LinearAddPlan& plan, const Tensor& x, const Weight& w,
-                                Tensor& residual_out, WorkspaceArena& ws, cudaStream_t stream);
+                                Tensor& residual_out, WorkspaceArena* ws, cudaStream_t stream);
 void q5_linear_add_dispatch(const Tensor& x, const Weight& w, Tensor& residual_out,
-                            WorkspaceArena& ws, cudaStream_t stream);
+                            WorkspaceArena* ws, cudaStream_t stream);
 
 } // namespace ninfer::ops::detail

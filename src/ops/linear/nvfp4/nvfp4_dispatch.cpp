@@ -27,7 +27,11 @@ Nvfp4LinearRoute resolve_route(std::int32_t output_rows, std::int32_t input_rows
         throw std::invalid_argument("nvfp4 linear: unsupported policy");
     }
 
-    switch (resolve_nvfp4_problem(output_rows, input_rows)) {
+    // A tp2 shard resolves through its tp1 parent: halving N or K shifts the measured A16/W4A4
+    // crossover somewhat, but inheriting keeps the split path's route a pure function of the
+    // family, so a tp2 run cannot silently take a different numerical path than its tp1 twin.
+    // Re-measuring the shard crossovers is a separate, benchmarked change.
+    switch (nvfp4_parent_problem(resolve_nvfp4_problem(output_rows, input_rows))) {
     case Nvfp4Problem::AttnInput:
         return tokens >= 4 ? Nvfp4LinearRoute::W4A4 : Nvfp4LinearRoute::A16;
     case Nvfp4Problem::GdnInput:
@@ -37,6 +41,12 @@ Nvfp4LinearRoute resolve_route(std::int32_t output_rows, std::int32_t input_rows
     case Nvfp4Problem::Residual6144:
     case Nvfp4Problem::Residual17408:
         return tokens >= 8 ? Nvfp4LinearRoute::W4A4 : Nvfp4LinearRoute::A16;
+    case Nvfp4Problem::AttnInputTp2Column:
+    case Nvfp4Problem::GdnInputTp2Column:
+    case Nvfp4Problem::MlpGateUpTp2Column:
+    case Nvfp4Problem::Residual6144Tp2Row:
+    case Nvfp4Problem::Residual17408Tp2Row:
+        break; // nvfp4_parent_problem never returns a shard problem
     }
     throw std::logic_error("unreachable NVFP4 linear problem");
 }

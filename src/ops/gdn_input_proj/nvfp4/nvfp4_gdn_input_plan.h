@@ -28,4 +28,21 @@ void nvfp4_gdn_input_w4a4_launch(const Tensor& x, const Weight& weight, Tensor& 
 void nvfp4_gdn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                               LinearPolicy policy, WorkspaceArena* workspace, cudaStream_t stream);
 
+// --- tp2 column-shard siblings, instantiated at Nvfp4GdnInputTp2ColumnGeometry (registered in
+// src/ops/linear/nvfp4/nvfp4_config.h). Mirrors attn_input_proj's `_shard` naming exactly. ---
+
+void nvfp4_gdn_input_decode_launch_shard(const Tensor& x, const Weight& weight, Tensor& qkv,
+                                         Tensor& z, cudaStream_t stream);
+
+void nvfp4_gdn_input_small_t_launch_shard(const Tensor& x, const Weight& weight, Tensor& qkv,
+                                          Tensor& z, cudaStream_t stream);
+
+void nvfp4_gdn_input_w4a4_launch_shard(const Tensor& x, const Weight& weight, Tensor& qkv,
+                                       Tensor& z, Nvfp4W4a4Workspace workspace,
+                                       cudaStream_t stream);
+
+void nvfp4_gdn_input_dispatch_shard(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
+                                    LinearPolicy policy, WorkspaceArena* workspace,
+                                    cudaStream_t stream);
+
 } // namespace ninfer::ops::detail

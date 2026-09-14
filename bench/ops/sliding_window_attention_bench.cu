@@ -1,8 +1,7 @@
 // Public-Op benchmark for symmetric sliding-window Softmax Attention.
-// Every measured eager launch and captured graph is produced by one public
-// sliding_window_attention() call.
+// Every measured eager launch and captured graph is produced by one public swa() call.
 
-#include "ninfer/ops/sliding_window_attention.h"
+#include "ninfer/ops/swa.h"
 
 #include "core/device.h"
 #include "core/cyclic_kv_cache.h"
@@ -28,12 +27,11 @@ using namespace ninfer;
 
 namespace {
 
-constexpr std::int32_t kHeadDim    = 128;
-constexpr std::int32_t kQueryHeads = 32;
-constexpr std::int32_t kKvHeads    = 8;
-constexpr std::int32_t kWindow     = 4096;
-constexpr float kScale             = 0.08838834764831844055F;
-constexpr ops::AttentionHeadGeometry kGeometry{kHeadDim, kQueryHeads, kKvHeads};
+constexpr std::int32_t kHeadDim     = 128;
+constexpr std::int32_t kQueryHeads  = 32;
+constexpr std::int32_t kKvHeads     = 8;
+constexpr std::int32_t kWindow      = 4096;
+constexpr float kScale              = 0.08838834764831844055F;
 constexpr std::size_t kFlushBytes   = std::size_t{256} << 20;
 constexpr double kDenseBf16TcTflops = 209.5;
 constexpr double kRtx5090DramGBs    = 1792.0;
@@ -172,10 +170,9 @@ CyclicKVCacheLayerView make_context_view(DeviceBuffer& k, DeviceBuffer& v) {
 }
 
 std::size_t workspace_capacity(std::int32_t tokens, std::int32_t context) {
-    const ops::SlidingWindowAttentionExecutionEnvelope envelope{
-        static_cast<std::uint32_t>(context), static_cast<std::uint32_t>(context)};
-    return ops::sliding_window_attention_workspace_capacity_bytes(kGeometry, kWindow, envelope,
-                                                                  tokens, tokens, 1);
+    const ops::SwaContextExecutionEnvelope envelope{static_cast<std::uint32_t>(context),
+                                                    static_cast<std::uint32_t>(context)};
+    return ops::swa_workspace_capacity_bytes(envelope, tokens, tokens, 1);
 }
 
 class Case {
@@ -214,10 +211,9 @@ public:
     }
 
     void launch(cudaStream_t stream) {
-        ops::sliding_window_attention(q_tensor_, query_k_tensor_, query_v_tensor_,
-                                      positions_tensor_, valid_tensor_, lane_tensor_, kGeometry,
-                                      kWindow, kScale, context_view_, envelope_, workspace_,
-                                      output_tensor_, stream);
+        ops::swa(q_tensor_, query_k_tensor_, query_v_tensor_, positions_tensor_, valid_tensor_,
+                 lane_tensor_, kScale, context_view_, envelope_, workspace_, output_tensor_,
+                 stream);
     }
 
     [[nodiscard]] std::size_t workspace_bytes() const noexcept { return workspace_bytes_; }
@@ -244,7 +240,7 @@ private:
     Tensor lane_tensor_;
     Tensor output_tensor_;
     CyclicKVCacheLayerView context_view_;
-    ops::SlidingWindowAttentionExecutionEnvelope envelope_;
+    ops::SwaContextExecutionEnvelope envelope_;
 };
 
 const char* execution_name(Execution execution) {

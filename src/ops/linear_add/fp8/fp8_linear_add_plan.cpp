@@ -18,16 +18,26 @@ enum class Fp8LinearAddRoute : std::uint8_t {
 
 Fp8LinearAddRoute resolve_route(std::int32_t output_rows, std::int32_t input_rows,
                                 LinearPolicy policy, std::int32_t tokens) {
+    // TP2: also admit the row-parallel halves of the two residual geometries (6144 -> 3072,
+    // 17408 -> 8704) -- the same shape rule NVFP4's own resolve_route widening follows
+    // (nvfp4_linear_add_plan.cpp), so ops::linear_add_row_parallel's fused rank can call this
+    // exact function.
     if (tokens <= 0 || output_rows != Fp8Residual6144Geometry::kOutputRows ||
         (input_rows != Fp8Residual6144Geometry::kInputRows &&
-         input_rows != Fp8Residual17408Geometry::kInputRows)) {
+         input_rows != Fp8Residual17408Geometry::kInputRows &&
+         input_rows != Fp8Residual6144Tp2RowGeometry::kInputRows &&
+         input_rows != Fp8Residual17408Tp2RowGeometry::kInputRows)) {
         throw std::invalid_argument("fp8 linear_add: unsupported shape");
     }
     if (policy == LinearPolicy::A16Only) { return Fp8LinearAddRoute::A16; }
     if (policy != LinearPolicy::AllowA8) {
         throw std::invalid_argument("fp8 linear_add: unsupported policy");
     }
-    const std::int32_t first_a8 = input_rows == Fp8Residual6144Geometry::kInputRows ? 22 : 25;
+    // Tuning inherited from the shard's parent family, never re-measured for the shard: the 3072
+    // shard inherits 6144's crossover, the 8704 shard inherits 17408's.
+    const bool is_6144_family = input_rows == Fp8Residual6144Geometry::kInputRows ||
+                                input_rows == Fp8Residual6144Tp2RowGeometry::kInputRows;
+    const std::int32_t first_a8 = is_6144_family ? 22 : 25;
     return tokens >= first_a8 ? Fp8LinearAddRoute::A8 : Fp8LinearAddRoute::A16;
 }
 
