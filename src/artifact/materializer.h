@@ -44,7 +44,7 @@ public:
 
     const MaterializationStats& stats() const noexcept { return stats_; }
 
-    DeviceArena& device_arena();
+    DeviceArena& device_arena(std::size_t index = 0);
 
 private:
     friend MaterializedArtifact materialize(const Reader&, const MaterializationPlan&,
@@ -55,7 +55,7 @@ private:
         std::vector<std::byte> resource;
     };
 
-    std::unique_ptr<DeviceArena> device_arena_;
+    std::vector<std::unique_ptr<DeviceArena>> device_arenas_;
     std::vector<ObjectStorage> objects_;
     MaterializationStats stats_;
 };

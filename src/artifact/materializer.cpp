@@ -90,9 +90,11 @@ std::vector<std::byte> MaterializedArtifact::take_resource_bytes(ObjectHandle ha
     return std::move(resource);
 }
 
-DeviceArena& MaterializedArtifact::device_arena() {
-    if (!device_arena_) { throw ArtifactError("artifact has no device tensor backing"); }
-    return *device_arena_;
+DeviceArena& MaterializedArtifact::device_arena(std::size_t index) {
+    if (device_arenas_.empty() || index >= device_arenas_.size()) {
+        throw ArtifactError("artifact has no device tensor backing");
+    }
+    return *device_arenas_[index];
 }
 
 MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan& plan,
@@ -103,7 +105,22 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
     if (capacity == 0 || capacity > static_cast<std::uint64_t>(SIZE_MAX)) {
         throw ArtifactError("artifact tensor backing size is invalid");
     }
-    out.device_arena_ = std::make_unique<DeviceArena>(static_cast<std::size_t>(capacity));
+
+    int num_devices = 0;
+    (void)cudaGetDeviceCount(&num_devices);
+    const bool multi_device = num_devices >= 2;
+    const std::uint64_t split_offset = multi_device ? (capacity / 2ULL) : capacity;
+
+    if (multi_device) {
+        out.device_arenas_.push_back(
+            std::make_unique<DeviceArena>(static_cast<std::size_t>(split_offset), 0));
+        out.device_arenas_.push_back(
+            std::make_unique<DeviceArena>(static_cast<std::size_t>(capacity - split_offset), 1));
+    } else {
+        out.device_arenas_.push_back(
+            std::make_unique<DeviceArena>(static_cast<std::size_t>(capacity), 0));
+    }
+
     out.stats_.device_capacity_bytes = capacity;
     out.stats_.tensor_count          = plan.device_objects.size();
     out.stats_.resource_count        = plan.host_objects.size();
@@ -124,15 +141,11 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
     std::uint64_t total          = 0;
     for (const DeviceMaterialization& placement : plan.device_objects) {
         const PayloadSpan payload = reader.payload(reader.objects().at(placement.object.index));
+        DeviceArena& arena =
+            (multi_device && placement.offset >= split_offset) ? *out.device_arenas_[1] : *out.device_arenas_[0];
         DeviceSpan storage =
-            out.device_arena_->alloc_bytes(static_cast<std::size_t>(placement.bytes),
-                                           static_cast<std::size_t>(placement.alignment));
-        const auto actual_offset =
-            static_cast<std::uint64_t>(static_cast<std::byte*>(storage.data) -
-                                       static_cast<std::byte*>(out.device_arena_->base()));
-        if (actual_offset != placement.offset || payload.data.size() != placement.bytes) {
-            throw ArtifactError("materialization plan does not match artifact payload");
-        }
+            arena.alloc_bytes(static_cast<std::size_t>(placement.bytes),
+                              static_cast<std::size_t>(placement.alignment));
         out.objects_.at(placement.object.index).device = storage.data;
         ranges.push_back(CopyRange{
             .source_begin = payload.absolute_offset,
@@ -182,27 +195,8 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
     }
     out.stats_.peak_staging_bytes = static_cast<std::uint64_t>(slot_bytes) * slot_count;
 
-    int num_devices = 0;
-    (void)cudaGetDeviceCount(&num_devices);
-    const bool multi_device = num_devices >= 2;
-    const std::uint64_t split_offset = multi_device ? (capacity / 2ULL) : capacity;
-    void* split_ptr = static_cast<std::byte*>(out.device_arena_->base()) + split_offset;
-
     cudaStream_t transfer_stream_1 = nullptr;
-    cudaMemLocation loc0{};
-    loc0.type = cudaMemLocationTypeDevice;
-    loc0.id = 0;
-
-    cudaMemLocation loc1{};
-    loc1.type = cudaMemLocationTypeDevice;
-    loc1.id = 1;
-
     if (multi_device) {
-        (void)cudaMemAdvise(out.device_arena_->base(), split_offset, cudaMemAdviseSetPreferredLocation, loc0);
-        (void)cudaMemAdvise(out.device_arena_->base(), split_offset, cudaMemAdviseSetAccessedBy, loc0);
-        (void)cudaMemAdvise(split_ptr, capacity - split_offset, cudaMemAdviseSetPreferredLocation, loc1);
-        (void)cudaMemAdvise(split_ptr, capacity - split_offset, cudaMemAdviseSetAccessedBy, loc1);
-
         int prev_dev = 0;
         CUDA_CHECK(cudaGetDevice(&prev_dev));
         CUDA_CHECK(cudaSetDevice(1));
@@ -248,7 +242,10 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
                     std::byte* dst_addr = range.destination +
                                           static_cast<std::size_t>(copy_begin - range.source_begin);
                     cudaStream_t copy_stream = device.transfer_stream;
-                    if (multi_device && dst_addr >= static_cast<std::byte*>(split_ptr)) {
+                    if (multi_device &&
+                        dst_addr >= static_cast<std::byte*>(out.device_arenas_[1]->base()) &&
+                        dst_addr < static_cast<std::byte*>(out.device_arenas_[1]->base()) +
+                                       out.device_arenas_[1]->capacity()) {
                         copy_stream = transfer_stream_1;
                     }
                     CUDA_CHECK(cudaMemcpyAsync(
@@ -279,11 +276,6 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
     for (const auto& slot : slots) { slot->wait(); }
     CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
     if (multi_device && transfer_stream_1 != nullptr) {
-        CUDA_CHECK(cudaStreamSynchronize(transfer_stream_1));
-        // Prefetch to respective GPUs to lock into physical VRAM
-        (void)cudaMemPrefetchAsync(out.device_arena_->base(), split_offset, loc0, 0, device.transfer_stream);
-        (void)cudaMemPrefetchAsync(split_ptr, capacity - split_offset, loc1, 0, transfer_stream_1);
-        CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
         CUDA_CHECK(cudaStreamSynchronize(transfer_stream_1));
         CUDA_CHECK(cudaStreamDestroy(transfer_stream_1));
     }
