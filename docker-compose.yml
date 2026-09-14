@@ -20,8 +20,8 @@
       --port 8080
       --tp 2
       --devices 0,1
-      --max-context 114688
-      --kv-capacity 114688
+      --max-context 65536
+      --kv-capacity 65536
       --kv-dtype int8
       --spec mtp
       --draft-tokens 3
